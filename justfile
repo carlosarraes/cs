@@ -65,6 +65,7 @@ release new_version:
         git commit -m "chore: release v$ver"
     fi
     git tag -a "v$ver" -m "v$ver"
-    git push origin HEAD
-    git push origin "v$ver"
+    remote="$(git config "branch.$(git branch --show-current).remote" 2>/dev/null || git remote | head -n1)"
+    git push "$remote" HEAD
+    git push "$remote" "v$ver"
     echo "Pushed v$ver — GitHub Actions will build and publish the release."
