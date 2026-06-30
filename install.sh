@@ -46,10 +46,7 @@ get_os() {
   OS=$(uname -s)
   case $OS in
   Linux) OS="linux" ;;
-  Darwin)
-    echo "macOS is not supported yet (cs is Linux-only for now)." >&2
-    exit 1
-    ;;
+  Darwin) OS="macos" ;;
   *)
     echo "Unsupported OS: $OS"
     exit 1
