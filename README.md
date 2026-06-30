@@ -7,7 +7,7 @@ instantly, so you can hop between personal/work/org accounts without
 re-authenticating every time. It never implements OAuth itself: it delegates
 login to `claude` and only ever swaps two JSON keys on disk.
 
-> Linux only, OAuth subscription accounts only (for now).
+> Linux and macOS. OAuth subscription accounts only (for now).
 
 ## Install
 
@@ -45,16 +45,17 @@ to skip the prompt).
 
 ## How it works
 
-A Claude login lives in two files:
+A Claude login is two pieces:
 
-- `~/.claude/.credentials.json` → `claudeAiOauth` (the OAuth tokens)
-- `~/.claude.json` → `oauthAccount` (account identity)
+- the OAuth tokens (`claudeAiOauth`) — on Linux in `~/.claude/.credentials.json`,
+  on macOS in the login Keychain (service `Claude Code-credentials`)
+- the account identity (`oauthAccount`) — in `~/.claude.json` on both platforms
 
-`cs add` captures those two values into `~/.local/share/cs/state.json` (mode
-600). `cs switch` writes them back atomically, patching **only** those keys — so
-your MCP tokens, project history, and settings are never touched. Before
-switching away it re-captures the current account, so Claude's rotated refresh
-tokens are always kept fresh.
+`cs add` captures those into `~/.local/share/cs/state.json` (mode 600). `cs
+switch` writes them back, patching **only** those keys — so your MCP tokens,
+project history, and settings are never touched. Before switching away it
+re-captures the current account, so Claude's rotated refresh tokens are always
+kept fresh.
 
 Honors `CLAUDE_CONFIG_DIR` and `XDG_DATA_HOME`.
 
