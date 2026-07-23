@@ -54,9 +54,14 @@ pub fn live_email() -> Result<Option<String>> {
 }
 
 /// Drive Codex's interactive login (ChatGPT sign-in).
-pub fn login() -> Result<()> {
-    let status = Command::new("codex")
-        .arg("login")
+pub fn login(device_auth: bool) -> Result<()> {
+    let mut cmd = Command::new("codex");
+    cmd.arg("login");
+    if device_auth {
+        // Device-code flow — works over SSH / headless (no localhost callback).
+        cmd.arg("--device-auth");
+    }
+    let status = cmd
         .status()
         .context("failed to run `codex` (is Codex CLI installed and on PATH?)")?;
     if !status.success() {

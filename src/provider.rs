@@ -28,11 +28,12 @@ impl Provider {
         }
     }
 
-    /// Drive the agent's interactive login.
-    pub fn login(self) -> Result<()> {
+    /// Drive the agent's interactive login. `device_auth` requests Codex's
+    /// device-code flow (for SSH/headless machines); it does not apply to Claude.
+    pub fn login(self, device_auth: bool) -> Result<()> {
         match self {
             Provider::Claude => claude::login(),
-            Provider::Codex => codex::login(),
+            Provider::Codex => codex::login(device_auth),
         }
     }
 

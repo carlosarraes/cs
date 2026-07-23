@@ -33,8 +33,9 @@ cs list                  # list saved accounts (* = current, - = previous)
 cs del work              # forget an alias (does not log you out)
 cs whoami                # show the live account on both Claude and Codex
 
-cs add work --codex      # same commands for Codex, with --codex
-cs switch - --codex      # toggle the previous Codex account
+cs add work --codex               # same commands for Codex, with --codex
+cs add work --codex --device-auth # device-code login, for SSH / headless
+cs switch - --codex               # toggle the previous Codex account
 ```
 
 | Command | Description |

@@ -51,8 +51,17 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
     ps.current = Some(target.to_string());
 }
 
-pub fn add(provider: Provider, alias: &str, current: bool, force: bool) -> Result<()> {
+pub fn add(
+    provider: Provider,
+    alias: &str,
+    current: bool,
+    force: bool,
+    device_auth: bool,
+) -> Result<()> {
     validate_alias(alias)?;
+    if device_auth && provider != Provider::Codex {
+        return Err(anyhow!("--device-auth requires --codex"));
+    }
     let mut state = State::load()?;
     if state.provider(provider).accounts.contains_key(alias) && !force {
         return Err(anyhow!(
@@ -69,7 +78,7 @@ pub fn add(provider: Provider, alias: &str, current: bool, force: bool) -> Resul
             refresh_snapshot(state.provider_mut(provider), &cur, provider);
         }
         println!("Launching {} login for '{alias}'…", provider.name());
-        provider.login()?;
+        provider.login(device_auth)?;
     }
 
     let (email, data) = provider.capture().context(if current {

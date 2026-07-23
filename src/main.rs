@@ -35,6 +35,9 @@ enum Commands {
         /// Overwrite the alias if it already exists
         #[arg(short, long)]
         force: bool,
+        /// Use Codex's device-code login (for SSH / headless machines)
+        #[arg(long)]
+        device_auth: bool,
     },
     /// Switch to an alias (use `-` for the previous account)
     Switch {
@@ -81,7 +84,8 @@ fn main() -> Result<()> {
             codex,
             current,
             force,
-        } => commands::add(provider_of(codex), &alias, current, force),
+            device_auth,
+        } => commands::add(provider_of(codex), &alias, current, force, device_auth),
         Commands::Switch { alias, codex, yes } => commands::switch(provider_of(codex), &alias, yes),
         Commands::Del { alias, codex } => commands::del(provider_of(codex), &alias),
         Commands::List { codex } => commands::list(provider_of(codex)),
