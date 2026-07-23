@@ -1,11 +1,12 @@
 # cs
 
-Switch between Claude Code accounts — like `cd -`, but for your Claude logins.
+Switch between Claude Code and Codex accounts — like `cd -`, but for your CLI logins.
 
 `cs` snapshots each account's credentials under an alias and restores them
 instantly, so you can hop between personal/work/org accounts without
 re-authenticating every time. It never implements OAuth itself: it delegates
-login to `claude` and only ever swaps two JSON keys on disk.
+login to `claude`/`codex` and only ever swaps credentials on disk. Claude Code
+is the default; add `--codex` to any command to target Codex instead.
 
 > Linux and macOS. OAuth subscription accounts only (for now).
 
@@ -30,6 +31,10 @@ cs switch work           # switch to "work"
 cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
 cs del work              # forget an alias (does not log you out)
+cs whoami                # show the live account on both Claude and Codex
+
+cs add work --codex      # same commands for Codex, with --codex
+cs switch - --codex      # toggle the previous Codex account
 ```
 
 | Command | Description |
@@ -38,26 +43,33 @@ cs del work              # forget an alias (does not log you out)
 | `cs switch <alias>` / `cs switch -` | Activate an alias; `-` is the previous one |
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
+| `cs whoami` | Show the live signed-in account on both Claude and Codex |
 | `cs --version` | Print version |
 
-If Claude Code is running when you switch, `cs` warns you first (pass `--yes`
-to skip the prompt).
+Every account command takes `--codex` to target Codex instead of Claude Code
+(the default). Claude and Codex aliases are independent — you can have a `work`
+in each. If Claude Code is running when you switch, `cs` warns you first (pass
+`--yes` to skip the prompt).
 
 ## How it works
 
-A Claude login is two pieces:
+**Claude** stores a login in two pieces:
 
 - the OAuth tokens (`claudeAiOauth`) — on Linux in `~/.claude/.credentials.json`,
   on macOS in the login Keychain (service `Claude Code-credentials`)
 - the account identity (`oauthAccount`) — in `~/.claude.json` on both platforms
 
-`cs add` captures those into `~/.local/share/cs/state.json` (mode 600). `cs
-switch` writes them back, patching **only** those keys — so your MCP tokens,
-project history, and settings are never touched. Before switching away it
-re-captures the current account, so Claude's rotated refresh tokens are always
-kept fresh.
+A Claude switch patches **only** those keys, so your MCP tokens, project history,
+and settings are never touched.
 
-Honors `CLAUDE_CONFIG_DIR` and `XDG_DATA_HOME`.
+**Codex** keeps everything in one file, `~/.codex/auth.json`, so a Codex switch
+is a whole-file swap; the account email is read from the `id_token`.
+
+Either way, `cs add` captures the account into `~/.local/share/cs/state.json`
+(mode 600, split per provider), and before switching away it re-captures the
+current account so rotated refresh tokens stay fresh.
+
+Honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `XDG_DATA_HOME`.
 
 ## License
 
