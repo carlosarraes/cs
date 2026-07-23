@@ -1,12 +1,20 @@
 mod claude;
+mod codex;
 mod commands;
+mod provider;
 mod state;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use provider::Provider;
 
 #[derive(Parser)]
-#[command(name = "cs", version, about = "Switch between Claude Code accounts")]
+#[command(
+    name = "cs",
+    version,
+    about = "Switch between Claude Code and Codex accounts"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,7 +26,10 @@ enum Commands {
     Add {
         /// Name to save the account as
         alias: String,
-        /// Snapshot the already-logged-in account instead of running `claude auth login`
+        /// Target Codex instead of Claude Code
+        #[arg(long)]
+        codex: bool,
+        /// Snapshot the already-logged-in account instead of running a login
         #[arg(long)]
         current: bool,
         /// Overwrite the alias if it already exists
@@ -29,6 +40,9 @@ enum Commands {
     Switch {
         /// Alias to switch to, or `-` for the previous account
         alias: String,
+        /// Target Codex instead of Claude Code
+        #[arg(long)]
+        codex: bool,
         /// Switch even if Claude Code is running, without prompting
         #[arg(short, long)]
         yes: bool,
@@ -37,9 +51,26 @@ enum Commands {
     Del {
         /// Alias to delete
         alias: String,
+        /// Target Codex instead of Claude Code
+        #[arg(long)]
+        codex: bool,
     },
     /// List saved aliases
-    List,
+    List {
+        /// List Codex aliases instead of Claude Code
+        #[arg(long)]
+        codex: bool,
+    },
+    /// Show the live account signed in on Claude Code and Codex
+    Whoami,
+}
+
+fn provider_of(codex: bool) -> Provider {
+    if codex {
+        Provider::Codex
+    } else {
+        Provider::Claude
+    }
 }
 
 fn main() -> Result<()> {
@@ -47,11 +78,13 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Add {
             alias,
+            codex,
             current,
             force,
-        } => commands::add(&alias, current, force),
-        Commands::Switch { alias, yes } => commands::switch(&alias, yes),
-        Commands::Del { alias } => commands::del(&alias),
-        Commands::List => commands::list(),
+        } => commands::add(provider_of(codex), &alias, current, force),
+        Commands::Switch { alias, codex, yes } => commands::switch(provider_of(codex), &alias, yes),
+        Commands::Del { alias, codex } => commands::del(provider_of(codex), &alias),
+        Commands::List { codex } => commands::list(provider_of(codex)),
+        Commands::Whoami => commands::whoami(),
     }
 }
