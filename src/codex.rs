@@ -43,9 +43,39 @@ pub fn capture() -> Result<(String, Value)> {
     Ok((identity(&auth), auth))
 }
 
-/// Restore a saved account: write `auth.json` verbatim (atomic, mode 600).
+/// Restore a saved account: write `auth.json` (atomic, mode 600) — UNLESS the
+/// live login is a newer copy of the SAME account, in which case keep the live
+/// tokens. Writing an older (rotated-past) refresh token over a fresher one is
+/// exactly what triggers OpenAI's `refresh_token_reused` revocation.
 pub fn restore(data: &Value) -> Result<()> {
+    if let Some(live) = read_auth()? {
+        if is_stale_downgrade(&live, data) {
+            return Ok(());
+        }
+    }
     util::atomic_write(&auth_path()?, &serde_json::to_vec_pretty(data)?)
+}
+
+fn account_id(auth: &Value) -> Option<&str> {
+    auth.get("tokens")?.get("account_id")?.as_str()
+}
+
+fn last_refresh(auth: &Value) -> Option<&str> {
+    auth.get("last_refresh").and_then(|v| v.as_str())
+}
+
+/// True if `data` is an OLDER snapshot of the SAME account that is currently
+/// live — restoring it would downgrade a freshly-rotated credential to a stale
+/// one. `last_refresh` is ISO-8601 written consistently by Codex, so lexical
+/// order matches chronological order.
+fn is_stale_downgrade(live: &Value, data: &Value) -> bool {
+    match (account_id(live), account_id(data)) {
+        (Some(a), Some(b)) if a == b => match (last_refresh(live), last_refresh(data)) {
+            (Some(live_ts), Some(snap_ts)) => live_ts > snap_ts,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The live account's email, or `None` if not signed in.
@@ -126,5 +156,38 @@ mod tests {
     fn identity_falls_back_to_api_key() {
         let auth = json!({"OPENAI_API_KEY": "sk-abc", "tokens": null});
         assert_eq!(identity(&auth), "(api key)");
+    }
+
+    fn auth(acct: &str, ts: &str) -> Value {
+        json!({"tokens": {"account_id": acct}, "last_refresh": ts})
+    }
+
+    #[test]
+    fn downgrade_blocked_for_same_account_older_snapshot() {
+        let live = auth("acc1", "2026-02-01T10:00:00Z");
+        let snap = auth("acc1", "2026-01-01T10:00:00Z");
+        assert!(is_stale_downgrade(&live, &snap));
+    }
+
+    #[test]
+    fn switch_to_different_account_is_allowed() {
+        let live = auth("acc1", "2026-02-01T10:00:00Z");
+        let snap = auth("acc2", "2026-01-01T10:00:00Z");
+        assert!(!is_stale_downgrade(&live, &snap));
+    }
+
+    #[test]
+    fn newer_or_equal_snapshot_is_allowed() {
+        let live = auth("acc1", "2026-01-01T10:00:00Z");
+        let newer = auth("acc1", "2026-02-01T10:00:00Z");
+        assert!(!is_stale_downgrade(&live, &newer));
+        assert!(!is_stale_downgrade(&live, &live.clone()));
+    }
+
+    #[test]
+    fn missing_timestamps_never_block() {
+        let live = json!({"tokens": {"account_id": "acc1"}});
+        let snap = json!({"tokens": {"account_id": "acc1"}});
+        assert!(!is_stale_downgrade(&live, &snap));
     }
 }
