@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 mod commands;
+mod config;
 mod provider;
 mod state;
 mod util;

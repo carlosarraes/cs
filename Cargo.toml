@@ -18,6 +18,9 @@ anyhow = "1"
 dirs = "5"
 libc = "0.2"
 base64 = "0.22"
+toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
