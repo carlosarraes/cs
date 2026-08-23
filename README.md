@@ -76,8 +76,8 @@ Or just run `cs start` in a tmux pane. Every `report.interval_secs` it logs a
 status block:
 
 ```
-[15:05] report  * carraes  45%  resets 2h14m   7d 12%  running 3h02m
-                - carlos   33%  resets 4h50m   7d  3%  idle 4h10m
+[15:05] report  * carraes  5h 45% (resets 2h14m) · 7d 12% (resets 4d2h) · running 3h02m
+                - carlos   5h 33% (resets 4h50m) · 7d  3% (resets 6d1h) · idle 4h10m
 [15:07] switch  carraes → carlos  (carraes 45% · carlos 33%)
 ```
 

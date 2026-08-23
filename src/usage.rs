@@ -223,10 +223,20 @@ pub fn carry_timers(prev: Option<&Observation>, obs: &mut Observation, now: i64)
     }
 }
 
-/// One line per account, e.g. `* carraes  45%  resets 2h14m  7d 12%  running 3h02m`.
-/// Markers: `*` current, `-` other, `~` unknown.
+/// One line per account, e.g.
+/// `* carraes  5h 45% (resets 2h14m) · 7d 12% (resets 4d2h) · running 3h02m`.
+/// Markers: `*` current, `-` other, `~` unknown. A window with no `resets_at`
+/// (idle account, no active session) shows just its percentage.
 pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
     let width = obs.accounts.keys().map(String::len).max().unwrap_or(0);
+    let window = |label: &str, w: &Window| match &w.resets_at {
+        Some(r) => format!(
+            "{label} {:.0}% (resets {})",
+            w.utilization,
+            fmt_countdown(r, now)
+        ),
+        None => format!("{label} {:.0}%", w.utilization),
+    };
     obs.accounts
         .iter()
         .map(|(alias, e)| {
@@ -242,35 +252,32 @@ pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
                     None => "idle".into(),
                 }
             };
-            let stale = match e.fetched_at {
-                Some(t) if now - t > 120 => format!("  ({} old)", fmt_duration(now - t)),
-                _ => String::new(),
+            let marker = match &e.reading {
+                _ if is_current => '*',
+                Reading::Known(_) => '-',
+                Reading::Unknown { .. } => '~',
             };
-            match &e.reading {
+            let mut parts = match &e.reading {
                 Reading::Known(u) => {
-                    let seven = u
-                        .seven_day
-                        .as_ref()
-                        .map(|w| format!("  7d {:>3.0}%", w.utilization))
-                        .unwrap_or_default();
-                    let resets = match &u.five_hour.resets_at {
-                        Some(r) => fmt_countdown(r, now),
-                        None => "—".into(),
-                    };
-                    format!(
-                        "{} {alias:<width$}  {:>3.0}%  resets {resets:<6}{seven}  {since}{stale}",
-                        if is_current { '*' } else { '-' },
-                        u.five_hour.utilization,
-                    )
+                    let mut p = vec![window("5h", &u.five_hour)];
+                    if let Some(w) = &u.seven_day {
+                        p.push(window("7d", w));
+                    }
+                    p
                 }
                 Reading::Unknown { reason } => {
                     let wait = match e.backoff_until {
                         Some(t) if t > now => format!(", retry in {}", fmt_duration(t - now)),
                         _ => String::new(),
                     };
-                    format!("~ {alias:<width$}   ??   {reason}{wait}  {since}")
+                    vec![format!("?? {reason}{wait}")]
                 }
+            };
+            parts.push(since);
+            if let Some(t) = e.fetched_at.filter(|t| now - t > 120) {
+                parts.push(format!("as of {} ago", fmt_duration(now - t)));
             }
+            format!("{marker} {alias:<width$}  {}", parts.join(" · "))
         })
         .collect()
 }
@@ -486,7 +493,8 @@ mod tests {
                 0,
             ),
         );
-        assert!(format_lines(&obs, 0)[0].contains("resets —"));
+        let line = &format_lines(&obs, 0)[0];
+        assert!(line.contains("5h 0%") && !line.contains("resets"), "{line}");
     }
 
     #[test]
@@ -654,10 +662,11 @@ mod tests {
         let lines = format_lines(&obs, now);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("* aa "), "{}", lines[0]);
-        assert!(lines[0].contains("  5%  resets 1h00m"), "{}", lines[0]);
+        assert!(lines[0].contains("5h 5% (resets 1h00m)"), "{}", lines[0]);
+        assert!(lines[0].contains("7d 0% (resets "), "{}", lines[0]);
         assert!(lines[0].contains("running 3h00m"), "{}", lines[0]);
         assert!(lines[1].starts_with("~ b  "), "{}", lines[1]);
-        assert!(lines[1].contains("token expired"), "{}", lines[1]);
+        assert!(lines[1].contains("?? token expired"), "{}", lines[1]);
         assert!(lines[1].contains("idle 3h00m"), "{}", lines[1]);
     }
 
