@@ -254,7 +254,11 @@ pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
                     )
                 }
                 Reading::Unknown { reason } => {
-                    format!("~ {alias:<width$}   ??   {reason}  {since}")
+                    let wait = match e.backoff_until {
+                        Some(t) if t > now => format!(", retry in {}", fmt_duration(t - now)),
+                        _ => String::new(),
+                    };
+                    format!("~ {alias:<width$}   ??   {reason}{wait}  {since}")
                 }
             }
         })
@@ -358,10 +362,7 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
                 .and_then(|h| h.trim().parse::<u64>().ok())
                 .unwrap_or(DEFAULT_RETRY_AFTER);
             return Err(FetchError {
-                msg: format!(
-                    "rate limited by usage API (429), retrying in {}",
-                    fmt_duration(secs as i64)
-                ),
+                msg: "rate limited by usage API (429)".into(),
                 retry_after: Some(secs),
             });
         }
