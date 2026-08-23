@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 mod commands;
 mod config;
+mod policy;
 mod provider;
 mod state;
 mod usage;
