@@ -52,9 +52,8 @@ pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) ->
     };
     let reading = match obs.reading(current) {
         Some(Reading::Known(u)) => u,
-        Some(Reading::Unknown { reason }) => {
-            return Decision::Stay(Some(format!("{current}: usage unknown — {reason}")))
-        }
+        // The daemon already logs Unknown transitions; nothing to add here.
+        Some(Reading::Unknown { .. }) => return Decision::Stay(None),
         None => return Decision::Stay(Some(format!("{current}: not polled"))),
     };
     let util = reading.five_hour.utilization;
@@ -311,10 +310,7 @@ mod tests {
             Decision::Stay(Some(_))
         ));
         let o = obs("a", &[("a", unknown()), ("b", known(0.0, RESET_A))]);
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Stay(Some(_))
-        ));
+        assert_eq!(decide(&o, &mut m, &cfg(), 1000), Decision::Stay(None));
         let none = Observation::default();
         assert!(matches!(
             decide(&none, &mut m, &cfg(), 1000),
