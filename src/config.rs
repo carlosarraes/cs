@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::util;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(rename = "auto-switcher")]
@@ -24,7 +24,11 @@ pub struct AutoSwitcher {
     pub enabled: bool,
     /// Switch when the current account's 5h usage crosses a multiple of this (%).
     pub step: u8,
+    /// How often the current account is polled.
     pub poll_secs: u64,
+    /// How often the other accounts are polled (only the current one drives the
+    /// trigger, and the usage API has a small request budget).
+    pub idle_poll_secs: u64,
     /// Never switch twice within this window (anti-flap).
     pub min_switch_gap_secs: u64,
     /// Never switch TO an account at or above this 5h usage (%).
@@ -48,22 +52,13 @@ pub struct Warmup {
     pub effort: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            auto_switcher: AutoSwitcher::default(),
-            report: Report::default(),
-            warmup: Warmup::default(),
-        }
-    }
-}
-
 impl Default for AutoSwitcher {
     fn default() -> Self {
         AutoSwitcher {
             enabled: true,
             step: 15,
             poll_secs: 60,
+            idle_poll_secs: 300,
             min_switch_gap_secs: 300,
             ceiling: 90,
         }
@@ -97,7 +92,11 @@ pub const DEFAULT_TOML: &str = r#"# cs daemon configuration — every key is opt
 enabled = true
 # Switch when the current account's 5h usage crosses a multiple of `step` (%).
 step = 15
+# How often the current account is polled. The usage API rate-limits bursts
+# (it answers 429 + Retry-After, which cs honors), so don't go much lower.
 poll_secs = 60
+# How often the other accounts are polled; only the current one drives the trigger.
+idle_poll_secs = 300
 # Never switch twice within this window (anti-flap).
 min_switch_gap_secs = 300
 # Never switch TO an account at or above this 5h usage (%).
@@ -115,13 +114,17 @@ model = "opus-5"
 effort = "low"
 "#;
 
-/// `$XDG_CONFIG_HOME/cs/config.toml`, falling back to `~/.config/cs/config.toml`.
-pub fn config_path() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+/// `$XDG_CONFIG_HOME`, falling back to `~/.config`.
+pub fn config_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("XDG_CONFIG_HOME") {
         Some(d) if !d.is_empty() && Path::new(&d).is_absolute() => PathBuf::from(d),
         _ => util::home()?.join(".config"),
-    };
-    Ok(base.join("cs").join("config.toml"))
+    })
+}
+
+/// `$XDG_CONFIG_HOME/cs/config.toml`, falling back to `~/.config/cs/config.toml`.
+pub fn config_path() -> Result<PathBuf> {
+    Ok(config_home()?.join("cs").join("config.toml"))
 }
 
 pub fn load() -> Result<Config> {
@@ -139,8 +142,18 @@ pub fn load_from(path: &Path) -> Result<Config> {
 fn parse(text: &str) -> Result<Config> {
     let cfg: Config = toml::from_str(text)?;
     anyhow::ensure!(cfg.auto_switcher.step > 0, "auto-switcher.step must be > 0");
-    anyhow::ensure!(cfg.auto_switcher.poll_secs > 0, "auto-switcher.poll_secs must be > 0");
-    anyhow::ensure!(cfg.report.interval_secs > 0, "report.interval_secs must be > 0");
+    anyhow::ensure!(
+        cfg.auto_switcher.poll_secs > 0,
+        "auto-switcher.poll_secs must be > 0"
+    );
+    anyhow::ensure!(
+        cfg.auto_switcher.idle_poll_secs > 0,
+        "auto-switcher.idle_poll_secs must be > 0"
+    );
+    anyhow::ensure!(
+        cfg.report.interval_secs > 0,
+        "report.interval_secs must be > 0"
+    );
     Ok(cfg)
 }
 
@@ -151,7 +164,10 @@ mod tests {
     #[test]
     fn missing_file_is_default() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_from(&dir.path().join("nope.toml")).unwrap(), Config::default());
+        assert_eq!(
+            load_from(&dir.path().join("nope.toml")).unwrap(),
+            Config::default()
+        );
     }
 
     #[test]

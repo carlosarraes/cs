@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 mod commands;
 mod config;
+mod daemon;
 mod policy;
 mod provider;
 mod state;
@@ -42,9 +43,10 @@ enum Commands {
         #[arg(long)]
         device_auth: bool,
     },
-    /// Switch to an alias (use `-` for the previous account)
+    /// Switch to an alias (`-` = previous account, `next` = least-used 5h account)
     Switch {
-        /// Alias to switch to, or `-` for the previous account
+        /// Alias to switch to, `-` for the previous account, or `next` for the
+        /// least-used (5h) Claude account
         alias: String,
         /// Target Codex instead of Claude Code
         #[arg(long)]
@@ -69,6 +71,31 @@ enum Commands {
     },
     /// Show the live account signed in on Claude Code and Codex
     Whoami,
+    /// Show every Claude account's 5h/7d usage (from the daemon's last poll)
+    Usage {
+        /// Poll the API right now instead of reading the daemon's last observation
+        #[arg(long)]
+        live: bool,
+    },
+    /// Run the auto-switcher in the foreground (Claude only)
+    Start,
+    /// Print the auto-switcher log
+    Logs {
+        /// Keep printing as new lines arrive
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Manage the background service
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Write a systemd user unit (Linux) / launchd agent (macOS) that runs `cs start` at login
+    Install,
 }
 
 fn provider_of(codex: bool) -> Provider {
@@ -93,5 +120,11 @@ fn main() -> Result<()> {
         Commands::Del { alias, codex } => commands::del(provider_of(codex), &alias),
         Commands::List { codex } => commands::list(provider_of(codex)),
         Commands::Whoami => commands::whoami(),
+        Commands::Usage { live } => commands::usage(live),
+        Commands::Start => daemon::run(),
+        Commands::Logs { follow } => daemon::logs(follow),
+        Commands::Daemon {
+            command: DaemonCommands::Install,
+        } => daemon::install(),
     }
 }

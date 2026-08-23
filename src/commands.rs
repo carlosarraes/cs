@@ -147,10 +147,13 @@ pub fn switch(provider: Provider, requested: &str, yes: bool) -> Result<()> {
 /// The least-used (5h) other Claude account, per the configured ceiling.
 fn next_target(provider: Provider, ps: &ProviderState) -> Result<String> {
     if provider != Provider::Claude {
-        return Err(anyhow!("`switch next` is Claude-only (usage data needs the Claude API)"));
+        return Err(anyhow!(
+            "`switch next` is Claude-only (usage data needs the Claude API)"
+        ));
     }
     let cfg = config::load()?;
-    let obs = usage::observe(ps, None, usage::now());
+    // Fresh numbers for everyone (idle 0), but still honoring any 429 backoff.
+    let obs = usage::observe(ps, Observation::load()?.as_ref(), usage::now(), 0);
     policy::pick_target(&obs, cfg.auto_switcher.ceiling, ps.current.as_deref())
         .map(String::from)
         .ok_or_else(|| {
@@ -286,17 +289,21 @@ pub fn usage(live: bool) -> Result<()> {
         if ps.accounts.is_empty() {
             return Err(anyhow!("no Claude accounts saved yet (see `cs add`)"));
         }
-        usage::observe(ps, Observation::load()?.as_ref(), now)
+        let obs = usage::observe(ps, Observation::load()?.as_ref(), now, 0);
+        obs.save()?;
+        obs
     } else {
-        Observation::load()?.ok_or_else(|| {
-            anyhow!("no observation yet — run `cs start` (or `cs usage --live`)")
-        })?
+        Observation::load()?
+            .ok_or_else(|| anyhow!("no observation yet — run `cs start` (or `cs usage --live`)"))?
     };
     for line in usage::format_lines(&obs, now) {
         println!("{line}");
     }
     if !live {
-        println!("observed {} ago", usage::fmt_duration(now - obs.observed_at));
+        println!(
+            "observed {} ago",
+            usage::fmt_duration(now - obs.observed_at)
+        );
     }
     Ok(())
 }

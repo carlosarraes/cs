@@ -151,7 +151,11 @@ fn lock_at(path: &Path, block: bool) -> Result<LockGuard> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    let op = if block { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    let op = if block {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
     // SAFETY: flock on an fd we own; it only manipulates the kernel lock table.
     if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
         return Err(std::io::Error::last_os_error()).context("locking state.json");

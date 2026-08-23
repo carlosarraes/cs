@@ -51,9 +51,27 @@ impl Reading {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub reading: Reading,
-    /// Epoch seconds when this alias last stopped being (or became) current.
+    /// When `reading` was actually fetched (it may be carried forward while
+    /// backed off or between idle polls).
+    #[serde(default)]
+    pub fetched_at: Option<i64>,
+    /// Don't poll this account again before this time (from `Retry-After`).
+    #[serde(default)]
+    pub backoff_until: Option<i64>,
+    /// Epoch seconds when this alias last stopped being current.
     #[serde(default)]
     pub last_active_at: Option<i64>,
+}
+
+impl Entry {
+    pub fn new(reading: Reading, fetched_at: i64) -> Entry {
+        Entry {
+            reading,
+            fetched_at: Some(fetched_at),
+            backoff_until: None,
+            last_active_at: None,
+        }
+    }
 }
 
 /// The daemon's last poll of every saved Claude account. All times are epoch seconds.
@@ -81,7 +99,8 @@ impl Observation {
         }
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Ok(Some(
-            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?,
         ))
     }
 
@@ -99,9 +118,17 @@ impl Observation {
 }
 
 /// Poll every saved Claude account. The current one is polled with the live
-/// token (Claude Code keeps it fresh); the others with their stored tokens.
-/// `prev` carries the running/idle timers forward.
-pub fn observe(ps: &ProviderState, prev: Option<&Observation>, now: i64) -> Observation {
+/// token (Claude Code keeps it fresh) every call; the others with their stored
+/// tokens at most every `idle_poll_secs`, since only the current one drives the
+/// switch trigger and the usage API has a small request budget. An account that
+/// answered 429 is left alone until its `Retry-After` passes, carrying its last
+/// reading forward. `prev` also carries the running/idle timers.
+pub fn observe(
+    ps: &ProviderState,
+    prev: Option<&Observation>,
+    now: i64,
+    idle_poll_secs: u64,
+) -> Observation {
     let mut obs = Observation {
         observed_at: now,
         current: ps.current.clone(),
@@ -110,26 +137,58 @@ pub fn observe(ps: &ProviderState, prev: Option<&Observation>, now: i64) -> Obse
     let live = claude::live_oauth().ok().flatten();
     for (alias, acct) in &ps.accounts {
         let is_current = ps.current.as_deref() == Some(alias.as_str());
+        let prev_entry = prev.and_then(|p| p.accounts.get(alias));
+        if let (false, Some(e)) = (
+            needs_poll(prev_entry, is_current, now, idle_poll_secs),
+            prev_entry,
+        ) {
+            obs.accounts.insert(alias.clone(), e.clone());
+            continue;
+        }
         let oauth = match (&live, is_current) {
             (Some(l), true) => Some(l.clone()),
             _ => acct.data.get("claudeAiOauth").cloned(),
         };
-        let reading = match oauth {
+        let polled = match oauth {
             Some(o) => poll(&o, now),
-            None => Reading::Unknown {
-                reason: "no claudeAiOauth saved".into(),
-            },
+            None => Polled::unknown("no claudeAiOauth saved"),
         };
-        obs.accounts.insert(
-            alias.clone(),
-            Entry {
-                reading,
-                last_active_at: None,
-            },
-        );
+        obs.accounts
+            .insert(alias.clone(), settle(polled, prev_entry, now));
     }
     carry_timers(prev, &mut obs, now);
     obs
+}
+
+/// Whether an account needs a fresh poll: never while backed off after a 429;
+/// always for the current account otherwise; non-current ones only once their
+/// last fetch is older than `idle_poll_secs`.
+fn needs_poll(prev: Option<&Entry>, is_current: bool, now: i64, idle_poll_secs: u64) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    if prev.backoff_until.is_some_and(|t| t > now) {
+        return false;
+    }
+    is_current
+        || prev
+            .fetched_at
+            .is_none_or(|t| now - t >= idle_poll_secs as i64)
+}
+
+/// Turn a poll result into the entry to store. On a 429 the previous Known
+/// reading (if any) is carried forward so the numbers stay visible and usable
+/// while we wait out `Retry-After`.
+fn settle(polled: Polled, prev: Option<&Entry>, now: i64) -> Entry {
+    let mut entry = Entry::new(polled.reading, now);
+    if let Some(secs) = polled.retry_after {
+        entry.backoff_until = Some(now + secs as i64);
+        if let Some(p) = prev.filter(|e| e.reading.known().is_some()) {
+            entry.reading = p.reading.clone();
+            entry.fetched_at = p.fetched_at;
+        }
+    }
+    entry
 }
 
 /// Carry `current_since` / `last_switch_at` / per-alias `last_active_at` from the
@@ -176,6 +235,10 @@ pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
                     None => "idle".into(),
                 }
             };
+            let stale = match e.fetched_at {
+                Some(t) if now - t > 120 => format!("  ({} old)", fmt_duration(now - t)),
+                _ => String::new(),
+            };
             match &e.reading {
                 Reading::Known(u) => {
                     let seven = u
@@ -184,7 +247,7 @@ pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
                         .map(|w| format!("  7d {:>3.0}%", w.utilization))
                         .unwrap_or_default();
                     format!(
-                        "{} {alias:<width$}  {:>3.0}%  resets {:<6}{seven}  {since}",
+                        "{} {alias:<width$}  {:>3.0}%  resets {:<6}{seven}  {since}{stale}",
                         if is_current { '*' } else { '-' },
                         u.five_hour.utilization,
                         fmt_countdown(&u.five_hour.resets_at, now),
@@ -203,31 +266,78 @@ pub fn usage_path() -> Result<PathBuf> {
     Ok(state::state_path()?.with_file_name("usage.json"))
 }
 
+/// Result of polling one account: the reading plus, on a 429, how long the API
+/// asked us to wait.
+pub struct Polled {
+    pub reading: Reading,
+    pub retry_after: Option<u64>,
+}
+
+impl Polled {
+    fn unknown(reason: &str) -> Polled {
+        Polled {
+            reading: Reading::Unknown {
+                reason: reason.into(),
+            },
+            retry_after: None,
+        }
+    }
+}
+
 /// Fetch usage for one account's `claudeAiOauth` payload. Skips the network when
 /// the access token is already expired (`expiresAt` is epoch millis), since the
 /// API would only answer 401.
-pub fn poll(oauth: &Value, now: i64) -> Reading {
+pub fn poll(oauth: &Value, now: i64) -> Polled {
     let Some(token) = oauth.get("accessToken").and_then(Value::as_str) else {
-        return Reading::Unknown {
-            reason: "no access token saved".into(),
-        };
+        return Polled::unknown("no access token saved");
     };
     if let Some(exp_ms) = oauth.get("expiresAt").and_then(Value::as_i64) {
         if exp_ms / 1000 <= now {
-            return Reading::Unknown {
-                reason: "token expired (refreshes on next switch)".into(),
-            };
+            return Polled::unknown("token expired (refreshes on next switch)");
         }
     }
     match fetch(token) {
-        Ok(u) => Reading::Known(u),
-        Err(e) => Reading::Unknown {
-            reason: e.to_string(),
+        Ok(u) => Polled {
+            reading: Reading::Known(u),
+            retry_after: None,
+        },
+        Err(e) => Polled {
+            retry_after: e.retry_after,
+            reading: Reading::Unknown {
+                reason: e.to_string(),
+            },
         },
     }
 }
 
-pub fn fetch(access_token: &str) -> Result<Usage> {
+#[derive(Debug)]
+pub struct FetchError {
+    msg: String,
+    /// Seconds from the `Retry-After` header of a 429.
+    pub retry_after: Option<u64>,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+impl FetchError {
+    fn new(msg: impl Into<String>) -> FetchError {
+        FetchError {
+            msg: msg.into(),
+            retry_after: None,
+        }
+    }
+}
+
+/// A 429 without `Retry-After` still backs off this long.
+const DEFAULT_RETRY_AFTER: u64 = 300;
+
+pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
         .build();
@@ -238,12 +348,29 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
         .set("Accept", "application/json")
         .call();
     let body = match resp {
-        Ok(r) => r.into_string().context("reading usage response")?,
-        Err(ureq::Error::Status(401, _)) => return Err(anyhow!("token rejected (401)")),
-        Err(ureq::Error::Status(code, _)) => return Err(anyhow!("usage API returned HTTP {code}")),
-        Err(ureq::Error::Transport(t)) => return Err(anyhow!("network: {t}")),
+        Ok(r) => r
+            .into_string()
+            .map_err(|e| FetchError::new(format!("reading usage response: {e}")))?,
+        Err(ureq::Error::Status(401, _)) => return Err(FetchError::new("token rejected (401)")),
+        Err(ureq::Error::Status(429, r)) => {
+            let secs = r
+                .header("retry-after")
+                .and_then(|h| h.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_RETRY_AFTER);
+            return Err(FetchError {
+                msg: format!(
+                    "rate limited by usage API (429), retrying in {}",
+                    fmt_duration(secs as i64)
+                ),
+                retry_after: Some(secs),
+            });
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(FetchError::new(format!("usage API returned HTTP {code}")))
+        }
+        Err(ureq::Error::Transport(t)) => return Err(FetchError::new(format!("network: {t}"))),
     };
-    parse_usage(&body)
+    parse_usage(&body).map_err(|e| FetchError::new(format!("{e:#}")))
 }
 
 pub fn parse_usage(body: &str) -> Result<Usage> {
@@ -323,8 +450,63 @@ mod tests {
     #[test]
     fn expired_token_is_unknown_without_network() {
         let oauth = json!({"accessToken": "t", "expiresAt": 1_000_000});
-        assert!(matches!(poll(&oauth, 2_000), Reading::Unknown { .. }));
-        assert!(matches!(poll(&json!({}), 0), Reading::Unknown { .. }));
+        assert!(matches!(
+            poll(&oauth, 2_000).reading,
+            Reading::Unknown { .. }
+        ));
+        assert!(matches!(
+            poll(&json!({}), 0).reading,
+            Reading::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn idle_accounts_poll_less_often_and_backoff_is_honored() {
+        let fresh = Entry::new(parse_usage(FIXTURE).map(Reading::Known).unwrap(), 1000);
+        assert!(needs_poll(None, false, 1000, 300));
+        assert!(needs_poll(Some(&fresh), true, 1001, 300));
+        assert!(!needs_poll(Some(&fresh), false, 1200, 300));
+        assert!(needs_poll(Some(&fresh), false, 1300, 300));
+        let mut limited = fresh.clone();
+        limited.backoff_until = Some(1500);
+        assert!(!needs_poll(Some(&limited), true, 1400, 300));
+        assert!(needs_poll(Some(&limited), true, 1500, 300));
+    }
+
+    #[test]
+    fn rate_limit_carries_last_known_reading_and_sets_backoff() {
+        let known = Entry::new(parse_usage(FIXTURE).map(Reading::Known).unwrap(), 1000);
+        let polled = Polled {
+            reading: Reading::Unknown {
+                reason: "429".into(),
+            },
+            retry_after: Some(278),
+        };
+        let e = settle(polled, Some(&known), 1100);
+        assert_eq!(e.reading, known.reading);
+        assert_eq!(e.fetched_at, Some(1000));
+        assert_eq!(e.backoff_until, Some(1378));
+        // No earlier reading to fall back on: stays Unknown but still backs off.
+        let polled = Polled {
+            reading: Reading::Unknown {
+                reason: "429".into(),
+            },
+            retry_after: Some(10),
+        };
+        let e = settle(polled, None, 1100);
+        assert!(matches!(e.reading, Reading::Unknown { .. }));
+        assert_eq!(e.backoff_until, Some(1110));
+        // A good poll clears everything.
+        let e = settle(
+            Polled {
+                reading: known.reading.clone(),
+                retry_after: None,
+            },
+            Some(&e),
+            1200,
+        );
+        assert_eq!(e.backoff_until, None);
+        assert_eq!(e.fetched_at, Some(1200));
     }
 
     #[test]
@@ -339,22 +521,22 @@ mod tests {
         obs.accounts.insert(
             "a".into(),
             Entry {
-                reading: Reading::Known(parse_usage(FIXTURE).unwrap()),
                 last_active_at: Some(90),
+                ..Entry::new(Reading::Known(parse_usage(FIXTURE).unwrap()), 0)
             },
         );
         obs.accounts.insert(
             "b".into(),
             Entry {
-                reading: Reading::Unknown {
-                    reason: "x".into(),
-                },
                 last_active_at: None,
+                ..Entry::new(Reading::Unknown { reason: "x".into() }, 0)
             },
         );
         obs.save_to(&path).unwrap();
         assert_eq!(Observation::load_from(&path).unwrap().unwrap(), obs);
-        assert!(Observation::load_from(&dir.path().join("none")).unwrap().is_none());
+        assert!(Observation::load_from(&dir.path().join("none"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -370,8 +552,8 @@ mod tests {
             prev.accounts.insert(
                 k.into(),
                 Entry {
-                    reading: Reading::Unknown { reason: "x".into() },
                     last_active_at: if k == "c" { Some(10) } else { None },
+                    ..Entry::new(Reading::Unknown { reason: "x".into() }, 0)
                 },
             );
         }
@@ -411,15 +593,20 @@ mod tests {
         obs.accounts.insert(
             "aa".into(),
             Entry {
-                reading: Reading::Known(parse_usage(FIXTURE).unwrap()),
                 last_active_at: None,
+                ..Entry::new(Reading::Known(parse_usage(FIXTURE).unwrap()), 0)
             },
         );
         obs.accounts.insert(
             "b".into(),
             Entry {
-                reading: Reading::Unknown { reason: "token expired".into() },
                 last_active_at: Some(now - 3 * 3600),
+                ..Entry::new(
+                    Reading::Unknown {
+                        reason: "token expired".into(),
+                    },
+                    0,
+                )
             },
         );
         let lines = format_lines(&obs, now);
@@ -440,7 +627,10 @@ mod tests {
         assert_eq!(fmt_duration(2 * 3600 + 14 * 60), "2h14m");
         assert_eq!(fmt_duration(3 * 86400 + 2 * 3600 + 5 * 60), "3d2h");
         let t = parse_rfc3339("2026-08-23T19:50:00.188677+00:00").unwrap();
-        assert_eq!(fmt_countdown("2026-08-23T19:50:00.188677+00:00", t - 3600), "1h00m");
+        assert_eq!(
+            fmt_countdown("2026-08-23T19:50:00.188677+00:00", t - 3600),
+            "1h00m"
+        );
         assert_eq!(fmt_countdown("garbage", 0), "?");
     }
 }
