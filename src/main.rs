@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod provider;
 mod state;
+mod usage;
 mod util;
 
 use anyhow::Result;
