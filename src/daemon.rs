@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -193,8 +193,9 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
     }
 
     let now = usage::now();
-    let _lock = state::lock()?;
-    let mut state = State::load()?;
+    // Read-only here; the lock is taken only around the actual switch so a manual
+    // `cs switch` never waits behind our network polls.
+    let state = State::load()?;
     let ps = state.provider(Provider::Claude);
     if ps.accounts.is_empty() {
         lp.warn_once(
@@ -254,7 +255,7 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
         Decision::Stay(None) => lp.prev = Some(obs),
         Decision::Switch { to, reason } => {
             let from = obs.current.clone().unwrap_or_default();
-            match commands::perform_switch(&mut state, Provider::Claude, &to) {
+            match locked_switch(&from, &to) {
                 Ok(_) => {
                     log.log("switch", &format!("{from} → {to}  ({reason})"));
                     lp.mem.last_switch_at = Some(now);
@@ -277,6 +278,21 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Switch under the state lock, re-reading `state.json` first and bailing if the
+/// current alias changed underneath us (a manual `cs switch` mid-tick).
+fn locked_switch(from: &str, to: &str) -> Result<()> {
+    let _lock = state::lock()?;
+    let mut state = State::load()?;
+    let current = state.provider(Provider::Claude).current.as_deref();
+    if current != Some(from) {
+        return Err(anyhow!(
+            "current account changed to {} meanwhile",
+            current.unwrap_or("none")
+        ));
+    }
+    commands::perform_switch(&mut state, Provider::Claude, to).map(drop)
 }
 
 /// Log when an account's usage becomes Unknown (or changes reason), and when it
@@ -425,8 +441,6 @@ fn launchd_plist(exe: &str) -> String {
 "#
     )
 }
-
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(test)]
 mod tests {
