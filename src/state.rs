@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::provider::Provider;
@@ -128,6 +130,35 @@ fn parse(bytes: &[u8]) -> Result<State> {
     serde_json::from_value(v).context("parsing state.json")
 }
 
+/// Held while reading-modifying-writing `state.json`; released on drop. Serialises
+/// the daemon against a concurrent `cs switch` so neither overwrites the other's
+/// freshly captured tokens.
+pub struct LockGuard(#[allow(dead_code)] File);
+
+pub fn lock() -> Result<LockGuard> {
+    lock_at(&state_path()?.with_file_name("state.lock"), true)
+}
+
+fn lock_at(path: &Path, block: bool) -> Result<LockGuard> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let op = if block { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    // SAFETY: flock on an fd we own; it only manipulates the kernel lock table.
+    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("locking state.json");
+    }
+    Ok(LockGuard(file))
+}
+
 /// `$XDG_DATA_HOME/cs/state.json`, falling back to `~/.local/share/cs/state.json`.
 pub fn state_path() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
@@ -176,6 +207,16 @@ mod tests {
             .claude
             .accounts
             .is_empty());
+    }
+
+    #[test]
+    fn lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        let held = lock_at(&path, true).unwrap();
+        assert!(lock_at(&path, false).is_err());
+        drop(held);
+        assert!(lock_at(&path, false).is_ok());
     }
 
     #[test]

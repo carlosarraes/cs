@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::{state, util};
+use crate::state::{self, ProviderState};
+use crate::{claude, util};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
@@ -95,6 +96,106 @@ impl Observation {
     pub fn reading(&self, alias: &str) -> Option<&Reading> {
         self.accounts.get(alias).map(|e| &e.reading)
     }
+}
+
+/// Poll every saved Claude account. The current one is polled with the live
+/// token (Claude Code keeps it fresh); the others with their stored tokens.
+/// `prev` carries the running/idle timers forward.
+pub fn observe(ps: &ProviderState, prev: Option<&Observation>, now: i64) -> Observation {
+    let mut obs = Observation {
+        observed_at: now,
+        current: ps.current.clone(),
+        ..Default::default()
+    };
+    let live = claude::live_oauth().ok().flatten();
+    for (alias, acct) in &ps.accounts {
+        let is_current = ps.current.as_deref() == Some(alias.as_str());
+        let oauth = match (&live, is_current) {
+            (Some(l), true) => Some(l.clone()),
+            _ => acct.data.get("claudeAiOauth").cloned(),
+        };
+        let reading = match oauth {
+            Some(o) => poll(&o, now),
+            None => Reading::Unknown {
+                reason: "no claudeAiOauth saved".into(),
+            },
+        };
+        obs.accounts.insert(
+            alias.clone(),
+            Entry {
+                reading,
+                last_active_at: None,
+            },
+        );
+    }
+    carry_timers(prev, &mut obs, now);
+    obs
+}
+
+/// Carry `current_since` / `last_switch_at` / per-alias `last_active_at` from the
+/// previous observation, stamping `now` wherever the current alias changed.
+pub fn carry_timers(prev: Option<&Observation>, obs: &mut Observation, now: i64) {
+    let Some(prev) = prev else {
+        return;
+    };
+    obs.last_switch_at = prev.last_switch_at;
+    if prev.current == obs.current {
+        obs.current_since = prev.current_since;
+    } else {
+        obs.current_since = Some(now);
+        obs.last_switch_at = Some(now);
+    }
+    for (alias, entry) in &mut obs.accounts {
+        if obs.current.as_deref() == Some(alias.as_str()) {
+            continue;
+        }
+        entry.last_active_at = if prev.current.as_deref() == Some(alias.as_str()) {
+            Some(now)
+        } else {
+            prev.accounts.get(alias).and_then(|e| e.last_active_at)
+        };
+    }
+}
+
+/// One line per account, e.g. `* carraes  45%  resets 2h14m  7d 12%  running 3h02m`.
+/// Markers: `*` current, `-` other, `~` unknown.
+pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
+    let width = obs.accounts.keys().map(String::len).max().unwrap_or(0);
+    obs.accounts
+        .iter()
+        .map(|(alias, e)| {
+            let is_current = obs.current.as_deref() == Some(alias.as_str());
+            let since = if is_current {
+                match obs.current_since {
+                    Some(t) => format!("running {}", fmt_duration(now - t)),
+                    None => "running".into(),
+                }
+            } else {
+                match e.last_active_at {
+                    Some(t) => format!("idle {}", fmt_duration(now - t)),
+                    None => "idle".into(),
+                }
+            };
+            match &e.reading {
+                Reading::Known(u) => {
+                    let seven = u
+                        .seven_day
+                        .as_ref()
+                        .map(|w| format!("  7d {:>3.0}%", w.utilization))
+                        .unwrap_or_default();
+                    format!(
+                        "{} {alias:<width$}  {:>3.0}%  resets {:<6}{seven}  {since}",
+                        if is_current { '*' } else { '-' },
+                        u.five_hour.utilization,
+                        fmt_countdown(&u.five_hour.resets_at, now),
+                    )
+                }
+                Reading::Unknown { reason } => {
+                    format!("~ {alias:<width$}   ??   {reason}  {since}")
+                }
+            }
+        })
+        .collect()
 }
 
 /// `usage.json` lives beside `state.json`.
@@ -194,6 +295,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const FIXTURE_RESET: &str = "2026-08-23T19:50:00.188677+00:00";
     // Trimmed from a real response; the many null buckets are omitted.
     const FIXTURE: &str = r#"{
         "five_hour": {"utilization": 5.0, "resets_at": "2026-08-23T19:50:00.188677+00:00",
@@ -253,6 +355,81 @@ mod tests {
         obs.save_to(&path).unwrap();
         assert_eq!(Observation::load_from(&path).unwrap().unwrap(), obs);
         assert!(Observation::load_from(&dir.path().join("none")).unwrap().is_none());
+    }
+
+    #[test]
+    fn timers_carry_and_stamp_on_switch() {
+        let mut prev = Observation {
+            observed_at: 100,
+            current: Some("a".into()),
+            current_since: Some(50),
+            last_switch_at: Some(50),
+            ..Default::default()
+        };
+        for k in ["a", "b", "c"] {
+            prev.accounts.insert(
+                k.into(),
+                Entry {
+                    reading: Reading::Unknown { reason: "x".into() },
+                    last_active_at: if k == "c" { Some(10) } else { None },
+                },
+            );
+        }
+        // Same current: everything carries.
+        let mut same = prev.clone();
+        same.current_since = None;
+        same.last_switch_at = None;
+        carry_timers(Some(&prev), &mut same, 200);
+        assert_eq!(same.current_since, Some(50));
+        assert_eq!(same.last_switch_at, Some(50));
+        assert_eq!(same.accounts["c"].last_active_at, Some(10));
+        // Switched a → b: b starts now, a stopped now, c untouched.
+        let mut next = prev.clone();
+        next.current = Some("b".into());
+        carry_timers(Some(&prev), &mut next, 200);
+        assert_eq!(next.current_since, Some(200));
+        assert_eq!(next.last_switch_at, Some(200));
+        assert_eq!(next.accounts["a"].last_active_at, Some(200));
+        assert_eq!(next.accounts["c"].last_active_at, Some(10));
+        // No previous observation: nothing to carry.
+        let mut fresh = prev.clone();
+        fresh.current_since = None;
+        carry_timers(None, &mut fresh, 200);
+        assert_eq!(fresh.current_since, None);
+    }
+
+    #[test]
+    fn format_lines_marks_current_and_unknown() {
+        let t = parse_rfc3339(FIXTURE_RESET).unwrap();
+        let now = t - 3600;
+        let mut obs = Observation {
+            observed_at: now,
+            current: Some("aa".into()),
+            current_since: Some(now - 3 * 3600),
+            ..Default::default()
+        };
+        obs.accounts.insert(
+            "aa".into(),
+            Entry {
+                reading: Reading::Known(parse_usage(FIXTURE).unwrap()),
+                last_active_at: None,
+            },
+        );
+        obs.accounts.insert(
+            "b".into(),
+            Entry {
+                reading: Reading::Unknown { reason: "token expired".into() },
+                last_active_at: Some(now - 3 * 3600),
+            },
+        );
+        let lines = format_lines(&obs, now);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("* aa "), "{}", lines[0]);
+        assert!(lines[0].contains("  5%  resets 1h00m"), "{}", lines[0]);
+        assert!(lines[0].contains("running 3h00m"), "{}", lines[0]);
+        assert!(lines[1].starts_with("~ b  "), "{}", lines[1]);
+        assert!(lines[1].contains("token expired"), "{}", lines[1]);
+        assert!(lines[1].contains("idle 3h00m"), "{}", lines[1]);
     }
 
     #[test]

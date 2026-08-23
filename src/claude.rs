@@ -78,6 +78,12 @@ pub fn restore(data: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The live `claudeAiOauth` payload (tokens + expiry), or `None` if not signed in.
+/// Claude Code keeps this one fresh, so it's the token to poll usage with.
+pub fn live_oauth() -> Result<Option<Value>> {
+    read_active_oauth()
+}
+
 /// The live account's email, or `None` if no OAuth login is active.
 pub fn live_email() -> Result<Option<String>> {
     if read_active_oauth()?.is_none() {

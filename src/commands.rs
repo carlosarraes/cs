@@ -1,15 +1,19 @@
-//! Implementations of the subcommands: add, switch, del, list, whoami.
+//! Implementations of the subcommands: add, switch, del, list, whoami, usage.
 
 use anyhow::{anyhow, Context, Result};
 use std::io::{self, IsTerminal, Write};
 
-use crate::claude;
 use crate::provider::Provider;
-use crate::state::{Account, ProviderState, State};
+use crate::state::{self, Account, ProviderState, State};
+use crate::usage::{self, Observation};
+use crate::{claude, config, policy};
+
+/// Aliases with special meaning to `switch` that can't be saved as accounts.
+const RESERVED: &[&str] = &["-", "next"];
 
 fn validate_alias(alias: &str) -> Result<()> {
     let ok = !alias.is_empty()
-        && alias != "-"
+        && !RESERVED.contains(&alias)
         && alias
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
@@ -17,7 +21,7 @@ fn validate_alias(alias: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "invalid alias '{alias}': use letters, digits, '.', '_', '-'"
+            "invalid alias '{alias}': use letters, digits, '.', '_', '-' (not `-`/`next`)"
         ))
     }
 }
@@ -62,6 +66,7 @@ pub fn add(
     if device_auth && provider != Provider::Codex {
         return Err(anyhow!("--device-auth requires --codex"));
     }
+    let _lock = state::lock()?;
     let mut state = State::load()?;
     if state.provider(provider).accounts.contains_key(alias) && !force {
         return Err(anyhow!(
@@ -108,8 +113,13 @@ pub fn add(
 }
 
 pub fn switch(provider: Provider, requested: &str, yes: bool) -> Result<()> {
+    let _lock = state::lock()?;
     let mut state = State::load()?;
-    let target = resolve_target(state.provider(provider), requested)?;
+    let target = if requested == "next" {
+        next_target(provider, state.provider(provider))?
+    } else {
+        resolve_target(state.provider(provider), requested)?
+    };
 
     if !state.provider(provider).accounts.contains_key(&target) {
         return Err(anyhow!(
@@ -129,29 +139,49 @@ pub fn switch(provider: Provider, requested: &str, yes: bool) -> Result<()> {
         return Ok(());
     }
 
+    let email = perform_switch(&mut state, provider, &target)?;
+    println!("Switched {} to '{target}' ({email}).", provider.name());
+    Ok(())
+}
+
+/// The least-used (5h) other Claude account, per the configured ceiling.
+fn next_target(provider: Provider, ps: &ProviderState) -> Result<String> {
+    if provider != Provider::Claude {
+        return Err(anyhow!("`switch next` is Claude-only (usage data needs the Claude API)"));
+    }
+    let cfg = config::load()?;
+    let obs = usage::observe(ps, None, usage::now());
+    policy::pick_target(&obs, cfg.auto_switcher.ceiling, ps.current.as_deref())
+        .map(String::from)
+        .ok_or_else(|| {
+            anyhow!(
+                "no other account is known and below {}%:\n{}",
+                cfg.auto_switcher.ceiling,
+                usage::format_lines(&obs, usage::now()).join("\n")
+            )
+        })
+}
+
+/// Re-capture the outgoing account, make `target` live, and record the switch.
+/// The caller holds `state::lock()` and has validated `target`. Returns the
+/// target's email.
+pub fn perform_switch(state: &mut State, provider: Provider, target: &str) -> Result<String> {
     // Re-capture the outgoing account so rotated refresh tokens aren't lost.
     if let Some(cur) = state.provider(provider).current.clone() {
         refresh_snapshot(state.provider_mut(provider), &cur, provider);
     }
-
     let account = state
         .provider(provider)
         .accounts
-        .get(&target)
-        .expect("checked above")
+        .get(target)
+        .ok_or_else(|| anyhow!("unknown {} alias '{target}'", provider.name()))?
         .clone();
     provider
         .restore(&account.data)
         .with_context(|| format!("switching to '{target}'"))?;
-
-    record_switch(state.provider_mut(provider), &target);
+    record_switch(state.provider_mut(provider), target);
     state.save()?;
-    println!(
-        "Switched {} to '{target}' ({}).",
-        provider.name(),
-        account.email
-    );
-    Ok(())
+    Ok(account.email)
 }
 
 /// Returns whether the switch should proceed. If Claude Code is running, warn;
@@ -182,6 +212,7 @@ fn confirm_if_running() -> Result<bool> {
 }
 
 pub fn del(provider: Provider, alias: &str) -> Result<()> {
+    let _lock = state::lock()?;
     let mut state = State::load()?;
     let ps = state.provider_mut(provider);
     if ps.accounts.remove(alias).is_none() {
@@ -245,6 +276,31 @@ pub fn whoami() -> Result<()> {
     Ok(())
 }
 
+/// Show every Claude account's 5h/7d usage — from the daemon's last observation,
+/// or polled right now with `--live`.
+pub fn usage(live: bool) -> Result<()> {
+    let now = usage::now();
+    let obs = if live {
+        let state = State::load()?;
+        let ps = state.provider(Provider::Claude);
+        if ps.accounts.is_empty() {
+            return Err(anyhow!("no Claude accounts saved yet (see `cs add`)"));
+        }
+        usage::observe(ps, Observation::load()?.as_ref(), now)
+    } else {
+        Observation::load()?.ok_or_else(|| {
+            anyhow!("no observation yet — run `cs start` (or `cs usage --live`)")
+        })?
+    };
+    for line in usage::format_lines(&obs, now) {
+        println!("{line}");
+    }
+    if !live {
+        println!("observed {} ago", usage::fmt_duration(now - obs.observed_at));
+    }
+    Ok(())
+}
+
 /// The saved alias whose email matches `email`, preferring the current one.
 fn matched_alias(ps: &ProviderState, email: &str) -> Option<String> {
     if let Some(cur) = &ps.current {
@@ -286,7 +342,7 @@ mod tests {
         for good in ["work", "a.b_c-1", "Personal"] {
             assert!(validate_alias(good).is_ok(), "{good} should be valid");
         }
-        for bad in ["", "-", "a/b", "a b", "a:b"] {
+        for bad in ["", "-", "next", "a/b", "a b", "a:b"] {
             assert!(validate_alias(bad).is_err(), "{bad:?} should be invalid");
         }
     }
