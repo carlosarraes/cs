@@ -106,8 +106,9 @@ Usage comes from the same endpoint Claude Code's `/usage` uses, polled with each
 account's stored token (the current one with the live token). That endpoint
 rate-limits bursts; `cs` honors its `Retry-After` and keeps the last numbers
 visible while it waits. An account whose stored token has expired shows as
-unknown and is never switched *to* — it refreshes as soon as it becomes current
-again. The daemon and a manual `cs switch` share a lock on `state.json`, so
+unknown and is switched *to* only as a last resort (when no account with known
+usage qualifies) — Claude Code refreshes the token as soon as it becomes
+current again. The daemon and a manual `cs switch` share a lock on `state.json`, so
 they can't overwrite each other.
 
 ## How it works

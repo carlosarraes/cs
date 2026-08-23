@@ -46,6 +46,21 @@ pub fn pick_target<'a>(
         .map(|(alias, _)| alias.as_str())
 }
 
+/// Expired-token accounts as a last resort: their real usage is unknown, but
+/// Claude Code refreshes the token as soon as they become current, so they're
+/// better than being stuck. Least-recently-active first (most likely to have
+/// reset); other Unknown reasons (429, network) stay ineligible.
+pub fn pick_expired_fallback<'a>(obs: &'a Observation, exclude: Option<&str>) -> Option<&'a str> {
+    obs.accounts
+        .iter()
+        .filter(|(alias, _)| Some(alias.as_str()) != exclude)
+        .filter(|(_, e)| {
+            matches!(&e.reading, Reading::Unknown { reason } if reason == usage::TOKEN_EXPIRED)
+        })
+        .min_by_key(|(alias, e)| (e.last_active_at.unwrap_or(i64::MIN), alias.as_str()))
+        .map(|(alias, _)| alias.as_str())
+}
+
 pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) -> Decision {
     let Some(current) = obs.current.as_deref() else {
         return Decision::Stay(Some("no current account set (run `cs add`)".into()));
@@ -97,11 +112,17 @@ pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) ->
                 reason: format!("{current} {util:.0}% · {to} {to_util:.0}%"),
             }
         }
-        None => Decision::Stay(Some(format!(
-            "{current} crossed {}% but no other account is known and below {}%",
-            b * u32::from(cfg.step),
-            cfg.ceiling
-        ))),
+        None => match pick_expired_fallback(obs, Some(current)) {
+            Some(to) => Decision::Switch {
+                to: to.to_string(),
+                reason: format!("{current} {util:.0}% · {to} token expired, usage unknown"),
+            },
+            None => Decision::Stay(Some(format!(
+                "{current} crossed {}% but no other account is known and below {}%",
+                b * u32::from(cfg.step),
+                cfg.ceiling
+            ))),
+        },
     }
 }
 
@@ -130,7 +151,7 @@ mod tests {
     fn unknown() -> Entry {
         Entry::new(
             Reading::Unknown {
-                reason: "token expired".into(),
+                reason: "rate limited by usage API (429)".into(),
             },
             0,
         )
@@ -299,6 +320,54 @@ mod tests {
             &[("a", known(15.0, RESET_A)), ("b", known(89.0, RESET_A))],
         );
         assert_eq!(pick_target(&o, 90, Some("a")), Some("b"));
+    }
+
+    #[test]
+    fn expired_token_is_last_resort_only() {
+        let expired = |last: Option<i64>| Entry {
+            last_active_at: last,
+            ..Entry::new(
+                Reading::Unknown {
+                    reason: usage::TOKEN_EXPIRED.into(),
+                },
+                0,
+            )
+        };
+        // A Known account below the ceiling still wins over an expired one.
+        let o = obs(
+            "a",
+            &[
+                ("a", known(15.0, RESET_A)),
+                ("b", expired(None)),
+                ("c", known(50.0, RESET_A)),
+            ],
+        );
+        let mut m = baselined("a", 5.0);
+        assert!(matches!(
+            decide(&o, &mut m, &cfg(), 1000),
+            Decision::Switch { to, .. } if to == "c"
+        ));
+        // Only expired ones left: switch to the least recently active.
+        let o = obs(
+            "a",
+            &[
+                ("a", known(15.0, RESET_A)),
+                ("b", expired(Some(500))),
+                ("c", expired(Some(100))),
+            ],
+        );
+        let mut m = baselined("a", 5.0);
+        assert!(matches!(
+            decide(&o, &mut m, &cfg(), 1000),
+            Decision::Switch { to, .. } if to == "c"
+        ));
+        // A 429/network Unknown is NOT eligible.
+        let o = obs("a", &[("a", known(15.0, RESET_A)), ("b", unknown())]);
+        let mut m = baselined("a", 5.0);
+        assert!(matches!(
+            decide(&o, &mut m, &cfg(), 1000),
+            Decision::Stay(Some(_))
+        ));
     }
 
     #[test]

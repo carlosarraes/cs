@@ -15,6 +15,11 @@ use crate::{claude, util};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// The Unknown reason for an expired stored token. The policy matches on this
+/// exact string to allow last-resort switches (Claude refreshes the token on
+/// first use once the account is current again).
+pub const TOKEN_EXPIRED: &str = "token expired (refreshes on next switch)";
+
 /// One rate-limit window as reported by the API.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
@@ -297,7 +302,7 @@ pub fn poll(oauth: &Value, now: i64) -> Polled {
     };
     if let Some(exp_ms) = oauth.get("expiresAt").and_then(Value::as_i64) {
         if exp_ms / 1000 <= now {
-            return Polled::unknown("token expired (refreshes on next switch)");
+            return Polled::unknown(TOKEN_EXPIRED);
         }
     }
     match fetch(token) {

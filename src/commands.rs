@@ -154,7 +154,9 @@ fn next_target(provider: Provider, ps: &ProviderState) -> Result<String> {
     let cfg = config::load()?;
     // Fresh numbers for everyone (idle 0), but still honoring any 429 backoff.
     let obs = usage::observe(ps, Observation::load()?.as_ref(), usage::now(), 0);
-    policy::pick_target(&obs, cfg.auto_switcher.ceiling, ps.current.as_deref())
+    let current = ps.current.as_deref();
+    policy::pick_target(&obs, cfg.auto_switcher.ceiling, current)
+        .or_else(|| policy::pick_expired_fallback(&obs, current))
         .map(String::from)
         .ok_or_else(|| {
             anyhow!(
