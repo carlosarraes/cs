@@ -25,8 +25,10 @@ pub const TOKEN_EXPIRED: &str = "token expired (refreshes on next switch)";
 pub struct Window {
     /// 0–100.
     pub utilization: f64,
-    /// RFC 3339 timestamp of the next reset.
-    pub resets_at: String,
+    /// RFC 3339 timestamp of the next reset. `None` when the window is not
+    /// active (e.g. an idle account with no session running).
+    #[serde(default)]
+    pub resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,11 +253,14 @@ pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
                         .as_ref()
                         .map(|w| format!("  7d {:>3.0}%", w.utilization))
                         .unwrap_or_default();
+                    let resets = match &u.five_hour.resets_at {
+                        Some(r) => fmt_countdown(r, now),
+                        None => "—".into(),
+                    };
                     format!(
-                        "{} {alias:<width$}  {:>3.0}%  resets {:<6}{seven}  {since}{stale}",
+                        "{} {alias:<width$}  {:>3.0}%  resets {resets:<6}{seven}  {since}{stale}",
                         if is_current { '*' } else { '-' },
                         u.five_hour.utilization,
-                        fmt_countdown(&u.five_hour.resets_at, now),
                     )
                 }
                 Reading::Unknown { reason } => {
@@ -385,7 +390,7 @@ pub fn parse_usage(body: &str) -> Result<Usage> {
         let w = v.get(key)?;
         Some(Window {
             utilization: w.get("utilization")?.as_f64()?,
-            resets_at: w.get("resets_at")?.as_str()?.to_string(),
+            resets_at: w.get("resets_at").and_then(Value::as_str).map(String::from),
         })
     };
     Ok(Usage {
@@ -442,7 +447,10 @@ mod tests {
     fn parses_real_response_shape() {
         let u = parse_usage(FIXTURE).unwrap();
         assert_eq!(u.five_hour.utilization, 5.0);
-        assert_eq!(u.five_hour.resets_at, "2026-08-23T19:50:00.188677+00:00");
+        assert_eq!(
+            u.five_hour.resets_at.as_deref(),
+            Some("2026-08-23T19:50:00.188677+00:00")
+        );
         assert_eq!(u.seven_day.unwrap().utilization, 0.0);
     }
 
@@ -451,6 +459,34 @@ mod tests {
         assert!(parse_usage(r#"{"seven_day": null}"#).is_err());
         let u = parse_usage(r#"{"five_hour": {"utilization": 1, "resets_at": "x"}}"#).unwrap();
         assert!(u.seven_day.is_none());
+    }
+
+    // Seen on a Team seat with no active session: the window exists but
+    // `resets_at` is null. Must parse, not error.
+    #[test]
+    fn null_resets_at_parses() {
+        let u = parse_usage(
+            r#"{"five_hour": {"utilization": 0.0, "resets_at": null},
+                "seven_day": {"utilization": 58.0, "resets_at": "2026-08-27T19:00:00.275071+00:00"}}"#,
+        )
+        .unwrap();
+        assert_eq!(u.five_hour.resets_at, None);
+        assert_eq!(u.seven_day.unwrap().utilization, 58.0);
+        let mut obs = Observation {
+            current: Some("a".into()),
+            ..Default::default()
+        };
+        obs.accounts.insert(
+            "a".into(),
+            Entry::new(
+                Reading::Known(
+                    parse_usage(r#"{"five_hour": {"utilization": 0.0, "resets_at": null}}"#)
+                        .unwrap(),
+                ),
+                0,
+            ),
+        );
+        assert!(format_lines(&obs, 0)[0].contains("resets —"));
     }
 
     #[test]

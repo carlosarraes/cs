@@ -72,7 +72,12 @@ pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) ->
         None => return Decision::Stay(Some(format!("{current}: not polled"))),
     };
     let util = reading.five_hour.utilization;
-    let reset = usage::parse_rfc3339(&reading.five_hour.resets_at).unwrap_or(0);
+    let reset = reading
+        .five_hour
+        .resets_at
+        .as_deref()
+        .and_then(usage::parse_rfc3339)
+        .unwrap_or(0);
     let b = bucket(util, cfg.step);
 
     // Resets jitter by sub-second amounts between polls; only a real new window counts.
@@ -140,7 +145,7 @@ mod tests {
             Reading::Known(Usage {
                 five_hour: Window {
                     utilization: util,
-                    resets_at: reset.into(),
+                    resets_at: Some(reset.into()),
                 },
                 seven_day: None,
             }),
