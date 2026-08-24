@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod daemon;
 mod policy;
+mod snapshot;
 mod state;
 mod usage;
 mod util;
@@ -67,6 +68,31 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Save the currently-open Claude sessions so they can be reopened after a
+    /// reboot (subcommands manage saved snapshots)
+    Snapshot {
+        #[command(subcommand)]
+        command: Option<SnapshotCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommands {
+    /// List snapshots, or the sessions inside one
+    List {
+        /// Snapshot id to show in detail
+        id: Option<String>,
+    },
+    /// Recreate a snapshot's sessions in tmux (newest snapshot by default)
+    Restore {
+        /// Snapshot id (defaults to the newest)
+        id: Option<String>,
+    },
+    /// Delete a snapshot
+    Del {
+        /// Snapshot id
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,5 +119,11 @@ fn main() -> Result<()> {
         Commands::Daemon {
             command: DaemonCommands::Install,
         } => daemon::install(),
+        Commands::Snapshot { command } => match command {
+            None => snapshot::take(),
+            Some(SnapshotCommands::List { id }) => snapshot::list(id.as_deref()),
+            Some(SnapshotCommands::Restore { id }) => snapshot::restore(id.as_deref()),
+            Some(SnapshotCommands::Del { id }) => snapshot::del(&id),
+        },
     }
 }

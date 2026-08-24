@@ -198,7 +198,10 @@ mod tests {
         assert_eq!(state.providers.claude.accounts["w"].email, "e");
         // Old codex data must survive a round-trip even though it's unused now.
         let back: Value = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(back["providers"]["codex"]["accounts"], serde_json::json!({}));
+        assert_eq!(
+            back["providers"]["codex"]["accounts"],
+            serde_json::json!({})
+        );
     }
 
     #[test]

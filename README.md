@@ -1,12 +1,11 @@
 # cs
 
-Switch between Claude Code and Codex accounts — like `cd -`, but for your CLI logins.
+Switch between Claude Code accounts — like `cd -`, but for your login.
 
 `cs` snapshots each account's credentials under an alias and restores them
 instantly, so you can hop between personal/work/org accounts without
 re-authenticating every time. It never implements OAuth itself: it delegates
-login to `claude`/`codex` and only ever swaps credentials on disk. Claude Code
-is the default; add `--codex` to any command to target Codex instead.
+login to `claude` and only ever swaps credentials on disk.
 
 > Linux and macOS. OAuth subscription accounts only (for now).
 
@@ -31,13 +30,12 @@ cs switch work           # switch to "work"
 cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
 cs del work              # forget an alias (does not log you out)
-cs whoami                # show the live account on both Claude and Codex
-cs switch next           # switch to the least-used (5h) Claude account
-cs usage [--live]        # every Claude account's 5h/7d usage
+cs whoami                # show the live signed-in account
+cs switch next           # switch to the least-used (5h) account
+cs usage [--live]        # every account's 5h/7d usage
 
-cs add work --codex               # same commands for Codex, with --codex
-cs add work --codex --device-auth # device-code login, for SSH / headless
-cs switch - --codex               # toggle the previous Codex account
+cs snapshot              # save the set of open Claude sessions (see below)
+cs snapshot restore      # after a reboot: reopen them all in tmux
 ```
 
 | Command | Description |
@@ -46,18 +44,17 @@ cs switch - --codex               # toggle the previous Codex account
 | `cs switch <alias>` / `cs switch -` | Activate an alias; `-` is the previous one |
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
-| `cs whoami` | Show the live signed-in account on both Claude and Codex |
-| `cs switch next` | Activate the least-used (5h) Claude account |
-| `cs usage [--live]` | Show every Claude account's 5h/7d usage (daemon's last poll, or `--live`) |
+| `cs whoami` | Show the live signed-in account |
+| `cs switch next` | Activate the least-used (5h) account |
+| `cs usage [--live]` | Show every account's 5h/7d usage (daemon's last poll, or `--live`) |
+| `cs snapshot` | Save the currently-open Claude sessions (`list`/`restore`/`del` manage them) |
 | `cs start` | Run the auto-switcher in the foreground (see below) |
 | `cs logs [-f]` | Print / follow the auto-switcher log |
 | `cs daemon install` | Install a systemd user unit / launchd agent that runs `cs start` at login |
 | `cs --version` | Print version |
 
-Every account command takes `--codex` to target Codex instead of Claude Code
-(the default). Claude and Codex aliases are independent — you can have a `work`
-in each. If Claude Code is running when you switch, `cs` warns you first (pass
-`--yes` to skip the prompt).
+If Claude Code is running when you switch, `cs` warns you first (pass `--yes`
+to skip the prompt).
 
 ## Auto-switcher (Claude only)
 
@@ -111,6 +108,28 @@ usage qualifies) — Claude Code refreshes the token as soon as it becomes
 current again. The daemon and a manual `cs switch` share a lock on `state.json`, so
 they can't overwrite each other.
 
+## Session snapshots
+
+Working in tmux with several Claudes open and need to reboot? `cs snapshot`
+records every *live* Claude Code session — its resume id, `/name`, working
+directory, and where it sits in tmux (session, window, split pane), resolved
+while everything is still running, so stale session files can't sneak in.
+
+```sh
+cs snapshot                  # → Snapshot '0823-2201' saved (5 sessions).
+# ...reboot...
+cs snapshot restore          # rebuilds the tmux sessions/windows/panes and
+                             # types `claude --resume <id>` into each pane
+cs snapshot list             # all snapshots (the newest is the restore default)
+cs snapshot list 0823-2201   # the sessions inside one: name · id · tmux spot · cwd
+```
+
+Restore recreates missing tmux sessions and windows with their original names
+(split panes come back tiled), skips sessions that are already running, and
+falls back to printing the `claude --resume` commands when tmux isn't
+available. Snapshots live in `~/.local/share/cs/snapshots.json`; the last 10
+are kept.
+
 ## How it works
 
 **Claude** stores a login in two pieces:
@@ -119,17 +138,16 @@ they can't overwrite each other.
   on macOS in the login Keychain (service `Claude Code-credentials`)
 - the account identity (`oauthAccount`) — in `~/.claude.json` on both platforms
 
-A Claude switch patches **only** those keys, so your MCP tokens, project history,
-and settings are never touched.
+A switch patches **only** those keys, so your MCP tokens, project history,
+and settings are never touched. `cs add` captures the account into
+`~/.local/share/cs/state.json` (mode 600), and before switching away `cs`
+re-captures the current account so rotated refresh tokens stay fresh.
 
-**Codex** keeps everything in one file, `~/.codex/auth.json`, so a Codex switch
-is a whole-file swap; the account email is read from the `id_token`.
+Honors `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 
-Either way, `cs add` captures the account into `~/.local/share/cs/state.json`
-(mode 600, split per provider), and before switching away it re-captures the
-current account so rotated refresh tokens stay fresh.
-
-Honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
+> Codex support was removed in 0.2.0 — `cs` is Claude-only now. Old Codex
+> snapshots in `state.json` are preserved untouched; use cs ≤ 0.1.6 if you
+> still need them.
 
 ## License
 

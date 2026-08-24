@@ -18,7 +18,7 @@ use std::process::Command;
 use crate::util::{home, patch_json, read_json_key};
 
 /// Claude Code's config home: `$CLAUDE_CONFIG_DIR` or `~/.claude`.
-fn config_home() -> Result<PathBuf> {
+pub fn config_home() -> Result<PathBuf> {
     match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         _ => Ok(home()?.join(".claude")),
@@ -306,7 +306,7 @@ pub fn running_pids() -> Vec<i64> {
 /// Whether a process is alive, via `kill(pid, 0)` — works on Linux and macOS.
 /// Signal 0 delivers nothing; it only probes existence/permission. An `EPERM`
 /// result means the process exists but we may not signal it — still alive.
-fn pid_alive(pid: i64) -> bool {
+pub fn pid_alive(pid: i64) -> bool {
     // SAFETY: kill() with signal 0 performs no signal delivery and has no
     // memory effects; it only returns an existence/permission status.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
