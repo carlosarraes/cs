@@ -1,24 +1,17 @@
 mod claude;
-mod codex;
 mod commands;
 mod config;
 mod daemon;
 mod policy;
-mod provider;
 mod state;
 mod usage;
 mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use provider::Provider;
 
 #[derive(Parser)]
-#[command(
-    name = "cs",
-    version,
-    about = "Switch between Claude Code and Codex accounts"
-)]
+#[command(name = "cs", version, about = "Switch between Claude Code accounts")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,27 +23,18 @@ enum Commands {
     Add {
         /// Name to save the account as
         alias: String,
-        /// Target Codex instead of Claude Code
-        #[arg(long)]
-        codex: bool,
         /// Snapshot the already-logged-in account instead of running a login
         #[arg(long)]
         current: bool,
         /// Overwrite the alias if it already exists
         #[arg(short, long)]
         force: bool,
-        /// Use Codex's device-code login (for SSH / headless machines)
-        #[arg(long)]
-        device_auth: bool,
     },
     /// Switch to an alias (`-` = previous account, `next` = least-used 5h account)
     Switch {
         /// Alias to switch to, `-` for the previous account, or `next` for the
-        /// least-used (5h) Claude account
+        /// least-used (5h) account
         alias: String,
-        /// Target Codex instead of Claude Code
-        #[arg(long)]
-        codex: bool,
         /// Switch even if Claude Code is running, without prompting
         #[arg(short, long)]
         yes: bool,
@@ -59,17 +43,10 @@ enum Commands {
     Del {
         /// Alias to delete
         alias: String,
-        /// Target Codex instead of Claude Code
-        #[arg(long)]
-        codex: bool,
     },
     /// List saved aliases
-    List {
-        /// List Codex aliases instead of Claude Code
-        #[arg(long)]
-        codex: bool,
-    },
-    /// Show the live account signed in on Claude Code and Codex
+    List,
+    /// Show the live signed-in account
     Whoami,
     /// Show every Claude account's 5h/7d usage (from the daemon's last poll)
     Usage {
@@ -98,27 +75,17 @@ enum DaemonCommands {
     Install,
 }
 
-fn provider_of(codex: bool) -> Provider {
-    if codex {
-        Provider::Codex
-    } else {
-        Provider::Claude
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Add {
             alias,
-            codex,
             current,
             force,
-            device_auth,
-        } => commands::add(provider_of(codex), &alias, current, force, device_auth),
-        Commands::Switch { alias, codex, yes } => commands::switch(provider_of(codex), &alias, yes),
-        Commands::Del { alias, codex } => commands::del(provider_of(codex), &alias),
-        Commands::List { codex } => commands::list(provider_of(codex)),
+        } => commands::add(&alias, current, force),
+        Commands::Switch { alias, yes } => commands::switch(&alias, yes),
+        Commands::Del { alias } => commands::del(&alias),
+        Commands::List => commands::list(),
         Commands::Whoami => commands::whoami(),
         Commands::Usage { live } => commands::usage(live),
         Commands::Start => daemon::run(),

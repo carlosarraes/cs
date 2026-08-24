@@ -13,7 +13,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use crate::provider::Provider;
 use crate::util;
 
 /// A saved account: a display email plus a provider-specific credential payload
@@ -71,8 +70,10 @@ pub struct ProviderState {
 pub struct Providers {
     #[serde(default)]
     pub claude: ProviderState,
-    #[serde(default)]
-    pub codex: ProviderState,
+    /// Codex support was removed in 0.2.0; any old snapshots are carried
+    /// through saves untouched so nothing is lost.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub codex: Value,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -82,18 +83,12 @@ pub struct State {
 }
 
 impl State {
-    pub fn provider(&self, p: Provider) -> &ProviderState {
-        match p {
-            Provider::Claude => &self.providers.claude,
-            Provider::Codex => &self.providers.codex,
-        }
+    pub fn claude(&self) -> &ProviderState {
+        &self.providers.claude
     }
 
-    pub fn provider_mut(&mut self, p: Provider) -> &mut ProviderState {
-        match p {
-            Provider::Claude => &mut self.providers.claude,
-            Provider::Codex => &mut self.providers.codex,
-        }
+    pub fn claude_mut(&mut self) -> &mut ProviderState {
+        &mut self.providers.claude
     }
 
     pub fn load() -> Result<State> {
@@ -190,7 +185,7 @@ mod tests {
         assert_eq!(acct.email, "a@b.com");
         assert_eq!(acct.data["claudeAiOauth"]["accessToken"], json!("x"));
         assert_eq!(acct.data["oauthAccount"]["emailAddress"], json!("a@b.com"));
-        assert!(state.providers.codex.accounts.is_empty());
+        assert!(state.providers.codex.is_null());
     }
 
     #[test]
@@ -201,6 +196,9 @@ mod tests {
         let state = parse(s).unwrap();
         assert_eq!(state.providers.claude.current.as_deref(), Some("w"));
         assert_eq!(state.providers.claude.accounts["w"].email, "e");
+        // Old codex data must survive a round-trip even though it's unused now.
+        let back: Value = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(back["providers"]["codex"]["accounts"], serde_json::json!({}));
     }
 
     #[test]

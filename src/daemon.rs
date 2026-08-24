@@ -18,7 +18,6 @@ use std::time::Duration;
 use crate::commands;
 use crate::config::{self, Config, DEFAULT_TOML};
 use crate::policy::{self, Decision, Mem};
-use crate::provider::Provider;
 use crate::state::{self, State};
 use crate::usage::{self, Observation, Reading};
 use crate::{claude, util};
@@ -196,12 +195,12 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
     // Read-only here; the lock is taken only around the actual switch so a manual
     // `cs switch` never waits behind our network polls.
     let state = State::load()?;
-    let ps = state.provider(Provider::Claude);
+    let ps = state.claude();
     if ps.accounts.is_empty() {
         lp.warn_once(
             log,
             "accounts",
-            "no Claude accounts saved — add some with `cs add`".into(),
+            "no accounts saved — add some with `cs add`".into(),
         );
         return Ok(());
     }
@@ -285,14 +284,14 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
 fn locked_switch(from: &str, to: &str) -> Result<()> {
     let _lock = state::lock()?;
     let mut state = State::load()?;
-    let current = state.provider(Provider::Claude).current.as_deref();
+    let current = state.claude().current.as_deref();
     if current != Some(from) {
         return Err(anyhow!(
             "current account changed to {} meanwhile",
             current.unwrap_or("none")
         ));
     }
-    commands::perform_switch(&mut state, Provider::Claude, to).map(drop)
+    commands::perform_switch(&mut state, to).map(drop)
 }
 
 /// Log when an account's usage becomes Unknown (or changes reason), and when it

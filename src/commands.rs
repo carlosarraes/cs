@@ -3,7 +3,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::{self, IsTerminal, Write};
 
-use crate::provider::Provider;
 use crate::state::{self, Account, ProviderState, State};
 use crate::usage::{self, Observation};
 use crate::{claude, config, policy};
@@ -28,9 +27,9 @@ fn validate_alias(alias: &str) -> Result<()> {
 
 /// Snapshot the live account into `ps.accounts[alias]` (no-op if there is no
 /// live account, so it is safe to call before destructive ops).
-fn refresh_snapshot(ps: &mut ProviderState, alias: &str, provider: Provider) {
+fn refresh_snapshot(ps: &mut ProviderState, alias: &str) {
     if let Some(acct) = ps.accounts.get_mut(alias) {
-        if let Ok((email, data)) = provider.capture() {
+        if let Ok((email, data)) = claude::capture() {
             acct.email = email;
             acct.data = data;
         }
@@ -55,44 +54,33 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
     ps.current = Some(target.to_string());
 }
 
-pub fn add(
-    provider: Provider,
-    alias: &str,
-    current: bool,
-    force: bool,
-    device_auth: bool,
-) -> Result<()> {
+pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
     validate_alias(alias)?;
-    if device_auth && provider != Provider::Codex {
-        return Err(anyhow!("--device-auth requires --codex"));
-    }
     let _lock = state::lock()?;
     let mut state = State::load()?;
-    if state.provider(provider).accounts.contains_key(alias) && !force {
+    if state.claude().accounts.contains_key(alias) && !force {
         return Err(anyhow!(
-            "{} alias '{alias}' already exists (use --force, or `cs del {alias}{}` first)",
-            provider.name(),
-            provider.flag_suffix()
+            "alias '{alias}' already exists (use --force, or `cs del {alias}` first)"
         ));
     }
 
     if !current {
         // Keep the outgoing account's snapshot fresh before login overwrites
         // the live credentials.
-        if let Some(cur) = state.provider(provider).current.clone() {
-            refresh_snapshot(state.provider_mut(provider), &cur, provider);
+        if let Some(cur) = state.claude().current.clone() {
+            refresh_snapshot(state.claude_mut(), &cur);
         }
-        println!("Launching {} login for '{alias}'…", provider.name());
-        provider.login(device_auth)?;
+        println!("Launching claude login for '{alias}'…");
+        claude::login()?;
     }
 
-    let (email, data) = provider.capture().context(if current {
+    let (email, data) = claude::capture().context(if current {
         "no active account to snapshot (log in first, or drop --current)"
     } else {
         "could not read the account after login"
     })?;
 
-    let ps = state.provider_mut(provider);
+    let ps = state.claude_mut();
     if ps.current.as_deref() != Some(alias) {
         ps.previous = ps.current.take();
     }
@@ -105,52 +93,39 @@ pub fn add(
         },
     );
     state.save()?;
-    println!(
-        "Saved {} account '{alias}' ({email}) and set it active.",
-        provider.name()
-    );
+    println!("Saved account '{alias}' ({email}) and set it active.");
     Ok(())
 }
 
-pub fn switch(provider: Provider, requested: &str, yes: bool) -> Result<()> {
+pub fn switch(requested: &str, yes: bool) -> Result<()> {
     let _lock = state::lock()?;
     let mut state = State::load()?;
     let target = if requested == "next" {
-        next_target(provider, state.provider(provider))?
+        next_target(state.claude())?
     } else {
-        resolve_target(state.provider(provider), requested)?
+        resolve_target(state.claude(), requested)?
     };
 
-    if !state.provider(provider).accounts.contains_key(&target) {
-        return Err(anyhow!(
-            "unknown {} alias '{target}' (see `cs list{}`)",
-            provider.name(),
-            provider.flag_suffix()
-        ));
+    if !state.claude().accounts.contains_key(&target) {
+        return Err(anyhow!("unknown alias '{target}' (see `cs list`)"));
     }
-    if state.provider(provider).current.as_deref() == Some(target.as_str()) {
+    if state.claude().current.as_deref() == Some(target.as_str()) {
         println!("Already on '{target}'.");
         return Ok(());
     }
 
-    // The running-warning only applies to Claude (Codex has no pid session files).
-    if provider == Provider::Claude && !yes && !confirm_if_running()? {
+    if !yes && !confirm_if_running()? {
         println!("Aborted.");
         return Ok(());
     }
 
-    let email = perform_switch(&mut state, provider, &target)?;
-    println!("Switched {} to '{target}' ({email}).", provider.name());
+    let email = perform_switch(&mut state, &target)?;
+    println!("Switched to '{target}' ({email}).");
     Ok(())
 }
 
-/// The least-used (5h) other Claude account, per the configured ceiling.
-fn next_target(provider: Provider, ps: &ProviderState) -> Result<String> {
-    if provider != Provider::Claude {
-        return Err(anyhow!(
-            "`switch next` is Claude-only (usage data needs the Claude API)"
-        ));
-    }
+/// The least-used (5h) other account, per the configured ceiling.
+fn next_target(ps: &ProviderState) -> Result<String> {
     let cfg = config::load()?;
     // Fresh numbers for everyone (idle 0), but still honoring any 429 backoff.
     let obs = usage::observe(ps, Observation::load()?.as_ref(), usage::now(), 0);
@@ -170,21 +145,19 @@ fn next_target(provider: Provider, ps: &ProviderState) -> Result<String> {
 /// Re-capture the outgoing account, make `target` live, and record the switch.
 /// The caller holds `state::lock()` and has validated `target`. Returns the
 /// target's email.
-pub fn perform_switch(state: &mut State, provider: Provider, target: &str) -> Result<String> {
+pub fn perform_switch(state: &mut State, target: &str) -> Result<String> {
     // Re-capture the outgoing account so rotated refresh tokens aren't lost.
-    if let Some(cur) = state.provider(provider).current.clone() {
-        refresh_snapshot(state.provider_mut(provider), &cur, provider);
+    if let Some(cur) = state.claude().current.clone() {
+        refresh_snapshot(state.claude_mut(), &cur);
     }
     let account = state
-        .provider(provider)
+        .claude()
         .accounts
         .get(target)
-        .ok_or_else(|| anyhow!("unknown {} alias '{target}'", provider.name()))?
+        .ok_or_else(|| anyhow!("unknown alias '{target}'"))?
         .clone();
-    provider
-        .restore(&account.data)
-        .with_context(|| format!("switching to '{target}'"))?;
-    record_switch(state.provider_mut(provider), target);
+    claude::restore(&account.data).with_context(|| format!("switching to '{target}'"))?;
+    record_switch(state.claude_mut(), target);
     state.save()?;
     Ok(account.email)
 }
@@ -216,12 +189,12 @@ fn confirm_if_running() -> Result<bool> {
     ))
 }
 
-pub fn del(provider: Provider, alias: &str) -> Result<()> {
+pub fn del(alias: &str) -> Result<()> {
     let _lock = state::lock()?;
     let mut state = State::load()?;
-    let ps = state.provider_mut(provider);
+    let ps = state.claude_mut();
     if ps.accounts.remove(alias).is_none() {
-        return Err(anyhow!("unknown {} alias '{alias}'", provider.name()));
+        return Err(anyhow!("unknown alias '{alias}'"));
     }
     if ps.current.as_deref() == Some(alias) {
         ps.current = None;
@@ -230,22 +203,15 @@ pub fn del(provider: Provider, alias: &str) -> Result<()> {
         ps.previous = None;
     }
     state.save()?;
-    println!(
-        "Deleted {} alias '{alias}'. (Live credentials were not changed.)",
-        provider.name()
-    );
+    println!("Deleted alias '{alias}'. (Live credentials were not changed.)");
     Ok(())
 }
 
-pub fn list(provider: Provider) -> Result<()> {
+pub fn list() -> Result<()> {
     let state = State::load()?;
-    let ps = state.provider(provider);
+    let ps = state.claude();
     if ps.accounts.is_empty() {
-        println!(
-            "No {} accounts saved yet. Add one with `cs add <alias>{}`.",
-            provider.name(),
-            provider.flag_suffix()
-        );
+        println!("No accounts saved yet. Add one with `cs add <alias>`.");
         return Ok(());
     }
     for (alias, acct) in &ps.accounts {
@@ -261,23 +227,21 @@ pub fn list(provider: Provider) -> Result<()> {
     Ok(())
 }
 
-/// Show the live signed-in account on both providers, with the matching alias.
+/// Show the live signed-in account, with the matching alias.
 pub fn whoami() -> Result<()> {
     let state = State::load()?;
-    for provider in [Provider::Claude, Provider::Codex] {
-        let ps = state.provider(provider);
-        let line = match provider.live_email() {
-            Ok(Some(email)) => {
-                let tag = matched_alias(ps, &email)
-                    .map(|a| format!("({a})"))
-                    .unwrap_or_else(|| "(not saved)".to_string());
-                format!("{email:<30} {tag}")
-            }
-            Ok(None) => "— not signed in".to_string(),
-            Err(e) => format!("— {e}"),
-        };
-        println!("{:<8} {line}", provider.name());
-    }
+    let ps = state.claude();
+    let line = match claude::live_email() {
+        Ok(Some(email)) => {
+            let tag = matched_alias(ps, &email)
+                .map(|a| format!("({a})"))
+                .unwrap_or_else(|| "(not saved)".to_string());
+            format!("{email:<30} {tag}")
+        }
+        Ok(None) => "— not signed in".to_string(),
+        Err(e) => format!("— {e}"),
+    };
+    println!("{line}");
     Ok(())
 }
 
@@ -287,9 +251,9 @@ pub fn usage(live: bool) -> Result<()> {
     let now = usage::now();
     let obs = if live {
         let state = State::load()?;
-        let ps = state.provider(Provider::Claude);
+        let ps = state.claude();
         if ps.accounts.is_empty() {
-            return Err(anyhow!("no Claude accounts saved yet (see `cs add`)"));
+            return Err(anyhow!("no accounts saved yet (see `cs add`)"));
         }
         let obs = usage::observe(ps, Observation::load()?.as_ref(), now, 0);
         obs.save()?;
