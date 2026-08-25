@@ -1,10 +1,11 @@
 //! Pure auto-switch policy: no I/O, no clock — everything comes in as arguments
 //! so it can be tested exhaustively.
 //!
-//! Rule: when the current account's 5h usage crosses a multiple of `step`
-//! (15 → 30 → 45 …) since we last (re)baselined, switch to the least-used other
-//! account that is below `ceiling`. Re-baseline whenever the current alias
-//! changes (manual `cs switch`) or its 5h window resets.
+//! Rule: every switch costs a full uncached re-read of each open session's
+//! context on the new account (~15% of a 5h window), so switch as *rarely* as
+//! possible: only once the current account reaches `switch_at`, only to an
+//! account with real headroom (below `ceiling`), not when the current window
+//! is about to reset anyway, and preferably between turns.
 
 use crate::config::AutoSwitcher;
 use crate::usage::{self, Observation, Reading};
@@ -12,22 +13,15 @@ use crate::usage::{self, Observation, Reading};
 /// Daemon memory carried between ticks.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Mem {
-    pub baseline_alias: Option<String>,
-    /// Epoch seconds of the 5h reset the baseline was taken in.
-    pub baseline_reset: i64,
-    pub baseline_bucket: u32,
     pub last_switch_at: Option<i64>,
+    /// When we first wanted to switch but held off for busy sessions.
+    pub waiting_since: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Stay(Option<String>),
     Switch { to: String, reason: String },
-}
-
-/// Which multiple of `step` `util` has reached: `bucket(29.9, 15) == 1`.
-pub fn bucket(util: f64, step: u8) -> u32 {
-    (util.max(0.0) / f64::from(step.max(1))).floor() as u32
 }
 
 /// Least-used Known account below `ceiling`, excluding `exclude`. Ties go to the
@@ -61,7 +55,14 @@ pub fn pick_expired_fallback<'a>(obs: &'a Observation, exclude: Option<&str>) ->
         .map(|(alias, _)| alias.as_str())
 }
 
-pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) -> Decision {
+/// `busy` = some live Claude Code session is mid-turn right now.
+pub fn decide(
+    obs: &Observation,
+    mem: &mut Mem,
+    cfg: &AutoSwitcher,
+    now: i64,
+    busy: bool,
+) -> Decision {
     let Some(current) = obs.current.as_deref() else {
         return Decision::Stay(Some("no current account set (run `cs add`)".into()));
     };
@@ -72,62 +73,69 @@ pub fn decide(obs: &Observation, mem: &mut Mem, cfg: &AutoSwitcher, now: i64) ->
         None => return Decision::Stay(Some(format!("{current}: not polled"))),
     };
     let util = reading.five_hour.utilization;
-    let reset = reading
+    if util < f64::from(cfg.switch_at) {
+        mem.waiting_since = None;
+        return Decision::Stay(None);
+    }
+
+    // Stable texts (no countdowns) so the daemon logs each reason once, not every tick.
+    let reset_in = reading
         .five_hour
         .resets_at
         .as_deref()
         .and_then(usage::parse_rfc3339)
-        .unwrap_or(0);
-    let b = bucket(util, cfg.step);
-
-    // Resets jitter by sub-second amounts between polls; only a real new window counts.
-    let window_changed = (reset - mem.baseline_reset).abs() > 60;
-    if mem.baseline_alias.as_deref() != Some(current) || window_changed {
-        *mem = Mem {
-            baseline_alias: Some(current.to_string()),
-            baseline_reset: reset,
-            baseline_bucket: b,
-            last_switch_at: mem.last_switch_at,
-        };
-        return Decision::Stay(Some(format!("baseline {current} at {util:.0}%")));
-    }
-    if b <= mem.baseline_bucket {
-        return Decision::Stay(None);
+        .map(|t| t - now);
+    if reset_in.is_some_and(|secs| secs <= cfg.skip_if_reset_within_secs as i64) {
+        mem.waiting_since = None;
+        return Decision::Stay(Some(format!(
+            "{current} at {util:.0}% but its window resets within {} — riding it out",
+            usage::fmt_duration(cfg.skip_if_reset_within_secs as i64)
+        )));
     }
     if let Some(last) = mem.last_switch_at {
-        let remaining = last + cfg.min_switch_gap_secs as i64 - now;
-        if remaining > 0 {
-            // Stable text (no countdown) so the daemon can log it once, not every tick.
+        if last + cfg.min_switch_gap_secs as i64 > now {
             return Decision::Stay(Some(format!(
-                "{current} crossed {}% but the last switch was under {}s ago — waiting",
-                b * u32::from(cfg.step),
+                "{current} at {util:.0}% but the last switch was under {}s ago — waiting",
                 cfg.min_switch_gap_secs
             )));
         }
     }
-    match pick_target(obs, cfg.ceiling, Some(current)) {
+    let target = match pick_target(obs, cfg.ceiling, Some(current)) {
         Some(to) => {
             let to_util = obs
                 .reading(to)
                 .and_then(Reading::known)
                 .map(|u| u.five_hour.utilization)
                 .unwrap_or(0.0);
-            Decision::Switch {
-                to: to.to_string(),
-                reason: format!("{current} {util:.0}% · {to} {to_util:.0}%"),
-            }
+            (to, format!("{current} {util:.0}% · {to} {to_util:.0}%"))
         }
         None => match pick_expired_fallback(obs, Some(current)) {
-            Some(to) => Decision::Switch {
-                to: to.to_string(),
-                reason: format!("{current} {util:.0}% · {to} token expired, usage unknown"),
-            },
-            None => Decision::Stay(Some(format!(
-                "{current} crossed {}% but no other account is known and below {}%",
-                b * u32::from(cfg.step),
-                cfg.ceiling
-            ))),
+            Some(to) => (
+                to,
+                format!("{current} {util:.0}% · {to} token expired, usage unknown"),
+            ),
+            None => {
+                mem.waiting_since = None;
+                return Decision::Stay(Some(format!(
+                    "{current} at {util:.0}% but no other account is known and below {}% — a switch would gain nothing",
+                    cfg.ceiling
+                )));
+            }
         },
+    };
+    if cfg.prefer_idle && busy {
+        let since = *mem.waiting_since.get_or_insert(now);
+        if now - since < cfg.idle_wait_max_secs as i64 {
+            return Decision::Stay(Some(format!(
+                "{current} at {util:.0}% — waiting for sessions to go idle before switching to {}",
+                target.0
+            )));
+        }
+    }
+    mem.waiting_since = None;
+    Decision::Switch {
+        to: target.0.to_string(),
+        reason: target.1,
     }
 }
 
@@ -136,21 +144,31 @@ mod tests {
     use super::*;
     use crate::usage::{Entry, Usage, Window};
 
-    const RESET_A: &str = "2026-08-23T19:50:00.188677+00:00";
-    const RESET_A_JITTER: &str = "2026-08-23T19:50:00.900000+00:00";
-    const RESET_B: &str = "2026-08-24T00:50:00.000000+00:00";
+    const NOW: i64 = 1_787_500_000;
+    /// A reset comfortably far away (2h).
+    const FAR: i64 = NOW + 7200;
 
-    fn known(util: f64, reset: &str) -> Entry {
+    fn reset(at: i64) -> String {
+        chrono::DateTime::from_timestamp(at, 0)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    fn known_at(util: f64, resets_at: i64) -> Entry {
         Entry::new(
             Reading::Known(Usage {
                 five_hour: Window {
                     utilization: util,
-                    resets_at: Some(reset.into()),
+                    resets_at: Some(reset(resets_at)),
                 },
                 seven_day: None,
             }),
             0,
         )
+    }
+
+    fn known(util: f64) -> Entry {
+        known_at(util, FAR)
     }
 
     fn unknown() -> Entry {
@@ -174,157 +192,108 @@ mod tests {
     }
 
     fn cfg() -> AutoSwitcher {
-        AutoSwitcher::default()
+        AutoSwitcher::default() // switch_at 95, ceiling 75, skip 1800s, gap 900s, idle wait 300s
     }
 
-    /// A Mem already baselined on `alias` in window RESET_A at `util`.
-    fn baselined(alias: &str, util: f64) -> Mem {
-        Mem {
-            baseline_alias: Some(alias.into()),
-            baseline_reset: usage::parse_rfc3339(RESET_A).unwrap(),
-            baseline_bucket: bucket(util, 15),
-            last_switch_at: None,
+    fn switch_to(d: Decision) -> String {
+        match d {
+            Decision::Switch { to, .. } => to,
+            other => panic!("expected switch, got {other:?}"),
         }
     }
 
     #[test]
-    fn bucket_is_floor_of_step_multiples() {
-        assert_eq!(bucket(0.0, 15), 0);
-        assert_eq!(bucket(14.9, 15), 0);
-        assert_eq!(bucket(15.0, 15), 1);
-        assert_eq!(bucket(29.9, 15), 1);
-        assert_eq!(bucket(45.0, 15), 3);
-        assert_eq!(bucket(-1.0, 15), 0);
+    fn stays_below_switch_at() {
+        let o = obs("a", &[("a", known(94.9)), ("b", known(0.0))]);
+        let mut m = Mem::default();
+        assert_eq!(decide(&o, &mut m, &cfg(), NOW, false), Decision::Stay(None));
     }
 
     #[test]
-    fn first_tick_sets_baseline_and_stays() {
+    fn switches_at_threshold_to_least_used() {
         let o = obs(
             "a",
-            &[("a", known(40.0, RESET_A)), ("b", known(10.0, RESET_A))],
+            &[("a", known(95.0)), ("b", known(40.0)), ("c", known(10.0))],
+        );
+        let mut m = Mem::default();
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "c");
+    }
+
+    #[test]
+    fn target_needs_real_headroom() {
+        // b at 80% is above the 75% ceiling: a switch would burn more than it gains.
+        let o = obs("a", &[("a", known(97.0)), ("b", known(80.0))]);
+        let mut m = Mem::default();
+        assert!(matches!(
+            decide(&o, &mut m, &cfg(), NOW, false),
+            Decision::Stay(Some(r)) if r.contains("gain nothing")
+        ));
+        let o = obs("a", &[("a", known(97.0)), ("b", known(74.0))]);
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "b");
+    }
+
+    #[test]
+    fn rides_out_an_imminent_reset() {
+        let o = obs(
+            "a",
+            &[("a", known_at(96.0, NOW + 20 * 60)), ("b", known(0.0))],
         );
         let mut m = Mem::default();
         assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Stay(Some(_))
+            decide(&o, &mut m, &cfg(), NOW, false),
+            Decision::Stay(Some(r)) if r.contains("riding it out")
         ));
-        assert_eq!(m.baseline_alias.as_deref(), Some("a"));
-        assert_eq!(m.baseline_bucket, 2);
-    }
-
-    #[test]
-    fn switches_on_crossing_to_least_used() {
+        // 31 minutes out is past the 30-minute grace: switch.
         let o = obs(
             "a",
-            &[
-                ("a", known(15.0, RESET_A)),
-                ("b", known(12.0, RESET_A)),
-                ("c", known(3.0, RESET_A)),
-            ],
+            &[("a", known_at(96.0, NOW + 31 * 60)), ("b", known(0.0))],
         );
-        let mut m = baselined("a", 5.0);
-        match decide(&o, &mut m, &cfg(), 1000) {
-            Decision::Switch { to, .. } => assert_eq!(to, "c"),
-            d => panic!("expected switch, got {d:?}"),
-        }
-    }
-
-    #[test]
-    fn stays_below_crossing() {
-        let o = obs(
-            "a",
-            &[("a", known(14.9, RESET_A)), ("b", known(0.0, RESET_A))],
-        );
-        let mut m = baselined("a", 5.0);
-        assert_eq!(decide(&o, &mut m, &cfg(), 1000), Decision::Stay(None));
-    }
-
-    #[test]
-    fn rebaselines_when_alias_changes_underneath() {
-        // User ran `cs switch b` manually; b is already at 31% — no spurious switch.
-        let o = obs(
-            "b",
-            &[("a", known(15.0, RESET_A)), ("b", known(31.0, RESET_A))],
-        );
-        let mut m = baselined("a", 5.0);
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Stay(Some(_))
-        ));
-        assert_eq!(m.baseline_alias.as_deref(), Some("b"));
-        assert_eq!(m.baseline_bucket, 2);
-    }
-
-    #[test]
-    fn rebaselines_on_window_reset_but_not_on_jitter() {
-        let mut m = baselined("a", 75.0);
-        // Jitter: same window, sub-second difference — still counts as crossing.
-        let o = obs(
-            "a",
-            &[
-                ("a", known(90.0, RESET_A_JITTER)),
-                ("b", known(0.0, RESET_A)),
-            ],
-        );
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Switch { .. }
-        ));
-        // Real reset: usage dropped to 2% in a new window — baseline, don't bounce.
-        let o = obs(
-            "a",
-            &[("a", known(2.0, RESET_B)), ("b", known(0.0, RESET_A))],
-        );
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Stay(Some(_))
-        ));
-        assert_eq!(m.baseline_bucket, 0);
-        assert_eq!(m.baseline_reset, usage::parse_rfc3339(RESET_B).unwrap());
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "b");
     }
 
     #[test]
     fn gap_blocks_then_allows() {
-        let o = obs(
-            "a",
-            &[("a", known(15.0, RESET_A)), ("b", known(0.0, RESET_A))],
-        );
-        let mut m = baselined("a", 5.0);
-        m.last_switch_at = Some(1000);
-        let c = cfg(); // gap 300
+        let o = obs("a", &[("a", known(96.0)), ("b", known(0.0))]);
+        let mut m = Mem {
+            last_switch_at: Some(NOW - 100),
+            ..Default::default()
+        };
         assert!(matches!(
-            decide(&o, &mut m, &c, 1200),
+            decide(&o, &mut m, &cfg(), NOW, false),
             Decision::Stay(Some(_))
         ));
-        assert!(matches!(
-            decide(&o, &mut m, &c, 1300),
-            Decision::Switch { .. }
-        ));
+        m.last_switch_at = Some(NOW - 901);
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "b");
     }
 
     #[test]
-    fn ceiling_excludes_and_unknown_is_never_picked() {
-        let o = obs(
-            "a",
-            &[
-                ("a", known(15.0, RESET_A)),
-                ("b", known(95.0, RESET_A)),
-                ("c", unknown()),
-            ],
-        );
-        assert_eq!(pick_target(&o, 90, Some("a")), None);
-        let mut m = baselined("a", 5.0);
+    fn waits_for_idle_then_gives_up_waiting() {
+        let o = obs("a", &[("a", known(96.0)), ("b", known(0.0))]);
+        let mut m = Mem::default();
         assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
+            decide(&o, &mut m, &cfg(), NOW, true),
+            Decision::Stay(Some(r)) if r.contains("idle")
+        ));
+        assert_eq!(m.waiting_since, Some(NOW));
+        // Still busy 4 minutes later: keep waiting.
+        assert!(matches!(
+            decide(&o, &mut m, &cfg(), NOW + 240, true),
             Decision::Stay(Some(_))
         ));
-        // Baseline untouched so we retry as soon as something becomes eligible.
-        assert_eq!(m.baseline_bucket, 0);
-        let o = obs(
-            "a",
-            &[("a", known(15.0, RESET_A)), ("b", known(89.0, RESET_A))],
-        );
-        assert_eq!(pick_target(&o, 90, Some("a")), Some("b"));
+        // Sessions go idle: switch immediately.
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW + 250, false)), "b");
+        assert_eq!(m.waiting_since, None);
+        // Or, busy past the cap: switch anyway.
+        let mut m = Mem {
+            waiting_since: Some(NOW - 301),
+            ..Default::default()
+        };
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, true)), "b");
+        // prefer_idle off: busy is ignored.
+        let mut c = cfg();
+        c.prefer_idle = false;
+        let mut m = Mem::default();
+        assert_eq!(switch_to(decide(&o, &mut m, &c, NOW, true)), "b");
     }
 
     #[test]
@@ -338,56 +307,41 @@ mod tests {
                 0,
             )
         };
-        // A Known account below the ceiling still wins over an expired one.
         let o = obs(
             "a",
-            &[
-                ("a", known(15.0, RESET_A)),
-                ("b", expired(None)),
-                ("c", known(50.0, RESET_A)),
-            ],
+            &[("a", known(96.0)), ("b", expired(None)), ("c", known(50.0))],
         );
-        let mut m = baselined("a", 5.0);
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Switch { to, .. } if to == "c"
-        ));
-        // Only expired ones left: switch to the least recently active.
+        let mut m = Mem::default();
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "c");
         let o = obs(
             "a",
             &[
-                ("a", known(15.0, RESET_A)),
+                ("a", known(96.0)),
                 ("b", expired(Some(500))),
                 ("c", expired(Some(100))),
             ],
         );
-        let mut m = baselined("a", 5.0);
+        assert_eq!(switch_to(decide(&o, &mut m, &cfg(), NOW, false)), "c");
+        let o = obs("a", &[("a", known(96.0)), ("b", unknown())]);
         assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
-            Decision::Switch { to, .. } if to == "c"
-        ));
-        // A 429/network Unknown is NOT eligible.
-        let o = obs("a", &[("a", known(15.0, RESET_A)), ("b", unknown())]);
-        let mut m = baselined("a", 5.0);
-        assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
+            decide(&o, &mut m, &cfg(), NOW, false),
             Decision::Stay(Some(_))
         ));
     }
 
     #[test]
     fn single_account_or_unknown_current_stays() {
-        let o = obs("a", &[("a", known(60.0, RESET_A))]);
-        let mut m = baselined("a", 5.0);
+        let o = obs("a", &[("a", known(99.0))]);
+        let mut m = Mem::default();
         assert!(matches!(
-            decide(&o, &mut m, &cfg(), 1000),
+            decide(&o, &mut m, &cfg(), NOW, false),
             Decision::Stay(Some(_))
         ));
-        let o = obs("a", &[("a", unknown()), ("b", known(0.0, RESET_A))]);
-        assert_eq!(decide(&o, &mut m, &cfg(), 1000), Decision::Stay(None));
+        let o = obs("a", &[("a", unknown()), ("b", known(0.0))]);
+        assert_eq!(decide(&o, &mut m, &cfg(), NOW, false), Decision::Stay(None));
         let none = Observation::default();
         assert!(matches!(
-            decide(&none, &mut m, &cfg(), 1000),
+            decide(&none, &mut m, &cfg(), NOW, false),
             Decision::Stay(Some(_))
         ));
     }

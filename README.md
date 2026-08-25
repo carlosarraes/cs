@@ -59,9 +59,15 @@ to skip the prompt).
 ## Auto-switcher (Claude only)
 
 With two or more Claude subscriptions saved, `cs start` rotates them for you:
-every time the current account's 5-hour usage crosses a multiple of `step`
-(15 → 30 → 45 %…), it switches to the least-used other account. Claude Code
-picks up the new credentials live, so a running session just keeps going.
+once the current account's 5-hour usage reaches `switch_at` (95%), it switches
+to the least-used other account. Claude Code picks up the new credentials
+live, so a running session just keeps going.
+
+It switches as *rarely* as it can, on purpose: prompt caches are per account,
+so every switch makes each open session re-read its whole context uncached on
+the new account (roughly 15% of a 5h window). So `cs` only switches near the
+top, only to an account with real headroom (`ceiling`), not when the current
+window is about to reset anyway, and preferably while no session is mid-turn.
 
 ```sh
 cs daemon install   # writes ~/.config/cs/config.toml + a user service, prints the enable command
@@ -84,11 +90,14 @@ every tick so edits apply without a restart):
 ```toml
 [auto-switcher]
 enabled = true
-step = 15                 # switch when the current account crosses a multiple of this (%)
+switch_at = 95            # switch once the current account reaches this 5h %
+ceiling = 75              # never switch TO an account at/above this 5h %
+skip_if_reset_within_secs = 1800  # don't switch to bridge a window that resets soon
+prefer_idle = true        # wait for sessions to go idle first (up to idle_wait_max_secs)
+idle_wait_max_secs = 300
 poll_secs = 60            # how often the current account is polled
 idle_poll_secs = 300      # how often the others are polled
-min_switch_gap_secs = 300 # never switch twice within this window
-ceiling = 90              # never switch TO an account at/above this 5h %
+min_switch_gap_secs = 900 # never switch twice within this window
 
 [report]
 enabled = true

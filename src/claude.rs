@@ -303,6 +303,31 @@ pub fn running_pids() -> Vec<i64> {
     pids
 }
 
+/// Whether any live Claude Code session is mid-turn (`status: "busy"` in its
+/// session file). Used to prefer switching between turns.
+pub fn any_session_busy() -> bool {
+    let Ok(dir) = config_home().map(|h| h.join("sessions")) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        v.get("status").and_then(Value::as_str) == Some("busy")
+            && v.get("pid").and_then(Value::as_i64).is_some_and(pid_alive)
+    })
+}
+
 /// Whether a process is alive, via `kill(pid, 0)` — works on Linux and macOS.
 /// Signal 0 delivers nothing; it only probes existence/permission. An `EPERM`
 /// result means the process exists but we may not signal it — still alive.

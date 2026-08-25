@@ -243,7 +243,8 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
         lp.prev = Some(obs);
         return Ok(());
     }
-    match policy::decide(&obs, &mut lp.mem, &lp.cfg.auto_switcher, now) {
+    let busy = lp.cfg.auto_switcher.prefer_idle && claude::any_session_busy();
+    match policy::decide(&obs, &mut lp.mem, &lp.cfg.auto_switcher, now, busy) {
         Decision::Stay(Some(reason)) => {
             if lp.last_stay.as_deref() != Some(&reason) {
                 log.log("info", &reason);
@@ -316,9 +317,9 @@ fn log_reading_transitions(lp: &mut Loop, log: &mut Logger, obs: &Observation) {
 fn verbose_line(cfg: &Config) -> String {
     let a = &cfg.auto_switcher;
     format!(
-        "auto-switcher {} (step {}, ceiling {}, poll {}s/{}s idle, gap {}s) · warmup {} · report every {}s",
+        "auto-switcher {} (switch at {}%, ceiling {}%, poll {}s/{}s idle, gap {}s) · warmup {} · report every {}s",
         on_off(a.enabled),
-        a.step,
+        a.switch_at,
         a.ceiling,
         a.poll_secs,
         a.idle_poll_secs,
