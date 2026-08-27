@@ -31,6 +31,7 @@ cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
 cs del work              # forget an alias (does not log you out)
 cs whoami                # show the live signed-in account
+cs refresh               # after a `/login` outside cs, update the saved credentials
 cs switch next           # switch to the least-used (5h) account
 cs usage [--live]        # every account's 5h/7d usage
 
@@ -45,6 +46,7 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
 | `cs whoami` | Show the live signed-in account |
+| `cs refresh` | Re-capture the live credentials into the alias they belong to |
 | `cs switch next` | Activate the least-used (5h) account |
 | `cs usage [--live]` | Show every account's 5h/7d usage (daemon's last poll, or `--live`) |
 | `cs snapshot` | Save the currently-open Claude sessions (`list`/`restore`/`del` manage them) |
@@ -55,6 +57,14 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 
 If Claude Code is running when you switch, `cs` warns you first (pass `--yes`
 to skip the prompt).
+
+Claude forces a fresh login every 7 days, so sooner or later you will run
+`/login` inside Claude Code rather than through `cs`. Run `cs refresh`
+afterwards and the saved copy catches up; it finds the right alias by email, so
+it cannot write one account's tokens into another account's alias, and it fixes
+`current` if the live login drifted. The daemon does this on its own while it
+runs. `cs` also refuses to overwrite an alias whose saved account differs from
+the live login, so a mistaken login can never repoint an alias at someone else.
 
 ## Auto-switcher (Claude only)
 

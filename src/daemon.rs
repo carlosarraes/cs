@@ -191,6 +191,16 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
         }
     }
 
+    match commands::refresh_current_if_stale() {
+        Ok(Some(alias)) => log.log("info", &format!("{alias}: saved credentials refreshed")),
+        Ok(None) => lp.clear_warn("refresh"),
+        Err(e) => lp.warn_once(
+            log,
+            "refresh",
+            format!("could not refresh credentials: {e:#}"),
+        ),
+    }
+
     let now = usage::now();
     // Read-only here; the lock is taken only around the actual switch so a manual
     // `cs switch` never waits behind our network polls.

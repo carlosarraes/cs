@@ -49,6 +49,8 @@ enum Commands {
     List,
     /// Show the live signed-in account
     Whoami,
+    /// Update a saved alias with the live credentials (after a `/login` outside cs)
+    Refresh,
     /// Show every Claude account's 5h/7d usage (from the daemon's last poll)
     Usage {
         /// Poll the API right now instead of reading the daemon's last observation
@@ -113,6 +115,7 @@ fn main() -> Result<()> {
         Commands::Del { alias } => commands::del(&alias),
         Commands::List => commands::list(),
         Commands::Whoami => commands::whoami(),
+        Commands::Refresh => commands::refresh(),
         Commands::Usage { live } => commands::usage(live),
         Commands::Start => daemon::run(),
         Commands::Logs { follow } => daemon::logs(follow),

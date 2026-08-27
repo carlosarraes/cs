@@ -1,6 +1,7 @@
 //! Implementations of the subcommands: add, switch, del, list, whoami, usage.
 
 use anyhow::{anyhow, Context, Result};
+use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 
 use crate::state::{self, Account, ProviderState, State};
@@ -25,14 +26,57 @@ fn validate_alias(alias: &str) -> Result<()> {
     }
 }
 
+/// Outcome of re-capturing the live credentials into a saved alias.
+#[derive(Debug, PartialEq)]
+enum Refreshed {
+    Wrote,
+    /// Nothing live to capture, or the alias is not saved.
+    Skipped,
+    /// The live login is a different account, so the alias was left alone.
+    Mismatch {
+        live: String,
+        saved: String,
+    },
+}
+
 /// Snapshot the live account into `ps.accounts[alias]` (no-op if there is no
 /// live account, so it is safe to call before destructive ops).
-fn refresh_snapshot(ps: &mut ProviderState, alias: &str) {
-    if let Some(acct) = ps.accounts.get_mut(alias) {
-        if let Ok((email, data)) = claude::capture() {
-            acct.email = email;
-            acct.data = data;
-        }
+fn refresh_snapshot(ps: &mut ProviderState, alias: &str) -> Refreshed {
+    match claude::capture() {
+        Ok((email, data)) => apply_snapshot(ps, alias, &email, data),
+        Err(_) => Refreshed::Skipped,
+    }
+}
+
+/// Write captured credentials into `alias`, but only when they belong to the
+/// same account. Logging in as someone else (Claude now forces a fresh login
+/// every 7 days) must not silently repoint an alias at another account.
+fn apply_snapshot(ps: &mut ProviderState, alias: &str, email: &str, data: Value) -> Refreshed {
+    let Some(acct) = ps.accounts.get_mut(alias) else {
+        return Refreshed::Skipped;
+    };
+    if acct.email != email && acct.email != "unknown" {
+        return Refreshed::Mismatch {
+            live: email.to_string(),
+            saved: acct.email.clone(),
+        };
+    }
+    acct.email = email.to_string();
+    acct.data = data;
+    Refreshed::Wrote
+}
+
+/// Whether the live credential is newer than the one saved under an alias.
+/// `stored` is a saved account's `data`; `live` is the live `claudeAiOauth`.
+fn live_is_newer(stored: &Value, live: &Value) -> bool {
+    let expires_at = |v: &Value| v.get("expiresAt").and_then(Value::as_i64);
+    match (
+        stored.get("claudeAiOauth").and_then(expires_at),
+        expires_at(live),
+    ) {
+        (Some(saved), Some(live)) => live > saved,
+        (None, Some(_)) => true,
+        _ => false,
     }
 }
 
@@ -60,7 +104,8 @@ pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
     let mut state = State::load()?;
     if state.claude().accounts.contains_key(alias) && !force {
         return Err(anyhow!(
-            "alias '{alias}' already exists (use --force, or `cs del {alias}` first)"
+            "alias '{alias}' already exists (run `cs refresh` to update its saved \
+             credentials, `--force` to overwrite it, or `cs del {alias}` first)"
         ));
     }
 
@@ -148,7 +193,12 @@ fn next_target(ps: &ProviderState) -> Result<String> {
 pub fn perform_switch(state: &mut State, target: &str) -> Result<String> {
     // Re-capture the outgoing account so rotated refresh tokens aren't lost.
     if let Some(cur) = state.claude().current.clone() {
-        refresh_snapshot(state.claude_mut(), &cur);
+        if let Refreshed::Mismatch { live, saved } = refresh_snapshot(state.claude_mut(), &cur) {
+            eprintln!(
+                "⚠ live login is {live} but alias '{cur}' is {saved}; leaving its saved \
+                 credentials alone (run `cs refresh` to resync)."
+            );
+        }
     }
     let account = state
         .claude()
@@ -243,6 +293,62 @@ pub fn whoami() -> Result<()> {
     };
     println!("{line}");
     Ok(())
+}
+
+/// Re-capture the live credentials into the alias they belong to. The alias is
+/// matched by email, so this can never write one account's tokens into another
+/// account's alias. Also fixes `current` when the live login drifted (a `/login`
+/// run outside cs).
+pub fn refresh() -> Result<()> {
+    let _lock = state::lock()?;
+    let mut state = State::load()?;
+    let (email, data) = claude::capture()
+        .context("no active Claude login to capture (run `claude auth login` first)")?;
+    let ps = state.claude_mut();
+    let alias = matched_alias(ps, &email).ok_or_else(|| {
+        anyhow!("live account {email} is not saved yet (run `cs add <alias> --current`)")
+    })?;
+    if apply_snapshot(ps, &alias, &email, data) != Refreshed::Wrote {
+        return Err(anyhow!("could not refresh '{alias}'"));
+    }
+    let moved = ps.current.as_deref() != Some(alias.as_str());
+    if moved {
+        record_switch(ps, &alias);
+    }
+    state.save()?;
+    println!("Refreshed '{alias}' ({email}).");
+    if moved {
+        println!("It is now the current account (the live login had drifted).");
+    }
+    Ok(())
+}
+
+/// Keep the current alias's saved credentials fresh while it stays active.
+/// Claude rotates the live token every few hours, and a saved copy left behind
+/// can expire outright, so the daemon re-captures it whenever the live one is
+/// newer. Returns the alias when it wrote. A live login belonging to a different
+/// account is left to the daemon's own identity warning.
+pub fn refresh_current_if_stale() -> Result<Option<String>> {
+    let state = State::load()?;
+    let Some(alias) = state.claude().current.clone() else {
+        return Ok(None);
+    };
+    let Some(acct) = state.claude().accounts.get(&alias) else {
+        return Ok(None);
+    };
+    let Some(live) = claude::live_oauth()? else {
+        return Ok(None);
+    };
+    if !live_is_newer(&acct.data, &live) {
+        return Ok(None);
+    }
+    let _lock = state::lock()?;
+    let mut state = State::load()?;
+    if refresh_snapshot(state.claude_mut(), &alias) != Refreshed::Wrote {
+        return Ok(None);
+    }
+    state.save()?;
+    Ok(Some(alias))
 }
 
 /// Show every Claude account's 5h/7d usage — from the daemon's last observation,
@@ -350,6 +456,56 @@ mod tests {
         record_switch(&mut ps, &t2);
         assert_eq!(ps.current.as_deref(), Some("work"));
         assert_eq!(ps.previous.as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn snapshot_refuses_to_repoint_an_alias_at_another_account() {
+        let mut ps = ps_with(Some("work"), None);
+        let fresh = json!({"claudeAiOauth": {"accessToken": "new"}});
+        // Same account: written.
+        assert_eq!(
+            apply_snapshot(&mut ps, "work", "work@x.com", fresh.clone()),
+            Refreshed::Wrote
+        );
+        assert_eq!(
+            ps.accounts["work"].data["claudeAiOauth"]["accessToken"],
+            json!("new")
+        );
+        // Different account: refused, alias untouched.
+        assert_eq!(
+            apply_snapshot(
+                &mut ps,
+                "work",
+                "someone@else.com",
+                json!({"claudeAiOauth": {}})
+            ),
+            Refreshed::Mismatch {
+                live: "someone@else.com".into(),
+                saved: "work@x.com".into(),
+            }
+        );
+        assert_eq!(ps.accounts["work"].email, "work@x.com");
+        assert_eq!(
+            ps.accounts["work"].data["claudeAiOauth"]["accessToken"],
+            json!("new")
+        );
+        // Unknown alias is a no-op.
+        assert_eq!(
+            apply_snapshot(&mut ps, "nope", "work@x.com", json!({})),
+            Refreshed::Skipped
+        );
+    }
+
+    #[test]
+    fn live_is_newer_compares_expiry() {
+        let stored = |ms: i64| json!({"claudeAiOauth": {"expiresAt": ms}});
+        assert!(live_is_newer(&stored(100), &json!({"expiresAt": 101})));
+        assert!(!live_is_newer(&stored(100), &json!({"expiresAt": 100})));
+        assert!(!live_is_newer(&stored(100), &json!({"expiresAt": 99})));
+        // Nothing saved yet, but something live: worth capturing.
+        assert!(live_is_newer(&json!({}), &json!({"expiresAt": 1})));
+        // No usable live timestamp: leave the saved copy alone.
+        assert!(!live_is_newer(&stored(100), &json!({})));
     }
 
     #[test]
