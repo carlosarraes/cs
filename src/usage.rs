@@ -228,14 +228,21 @@ pub fn carry_timers(prev: Option<&Observation>, obs: &mut Observation, now: i64)
 /// Markers: `*` current, `-` other, `~` unknown. A window with no `resets_at`
 /// (idle account, no active session) shows just its percentage.
 pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
+    format_lines_colored(obs, now, false)
+}
+
+pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<String> {
     let width = obs.accounts.keys().map(String::len).max().unwrap_or(0);
-    let window = |label: &str, w: &Window| match &w.resets_at {
-        Some(r) => format!(
-            "{label} {:.0}% (resets {})",
-            w.utilization,
-            fmt_countdown(r, now)
-        ),
-        None => format!("{label} {:.0}%", w.utilization),
+    let window = |label: &str, w: &Window| {
+        let text = match &w.resets_at {
+            Some(r) => format!(
+                "{label} {:.0}% (resets {})",
+                w.utilization,
+                fmt_countdown(r, now)
+            ),
+            None => format!("{label} {:.0}%", w.utilization),
+        };
+        color_window(text, w.utilization, color)
     };
     obs.accounts
         .iter()
@@ -435,6 +442,29 @@ pub fn fmt_countdown(resets_at: &str, now: i64) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+pub fn colors_enabled() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
+fn color_window(text: String, percent: f64, color: bool) -> String {
+    if !color || !percent.is_finite() || percent < 0.0 {
+        return text;
+    }
+    let code = if percent >= 100.0 {
+        "1;31"
+    } else if percent >= 90.0 {
+        "31"
+    } else if percent >= 70.0 {
+        "33"
+    } else {
+        "32"
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +479,39 @@ mod tests {
         "seven_day_opus": null,
         "extra_usage": {"is_enabled": false}
     }"#;
+
+    #[test]
+    fn usage_colors_each_window_by_its_own_quota() {
+        let mut obs = Observation::default();
+        for (alias, percent) in [("a", 69.0), ("b", 70.0), ("c", 90.0), ("d", 100.0)] {
+            let mut usage = parse_usage(FIXTURE).unwrap();
+            usage.five_hour.utilization = percent;
+            usage.five_hour.resets_at = Some("1970-01-01T01:00:00Z".into());
+            usage.seven_day = Some(Window {
+                utilization: 100.0,
+                resets_at: Some("1970-01-04T11:00:00Z".into()),
+            });
+            obs.accounts
+                .insert(alias.into(), Entry::new(Reading::Known(usage), 0));
+        }
+
+        let lines = format_lines_colored(&obs, 0, true);
+        for (line, (code, percent)) in
+            lines
+                .iter()
+                .zip([("32", 69), ("33", 70), ("31", 90), ("1;31", 100)])
+        {
+            assert!(
+                line.contains(&format!("\x1b[{code}m5h {percent}% (resets 1h00m)\x1b[0m")),
+                "{line:?}"
+            );
+            assert!(!line.starts_with('\x1b'), "only windows should be colored");
+        }
+        assert!(lines[0].contains("\x1b[1;31m7d 100% (resets 3d11h)\x1b[0m"));
+        assert!(format_lines_colored(&obs, 0, false)
+            .iter()
+            .all(|line| !line.contains('\x1b')));
+    }
 
     #[test]
     fn parses_real_response_shape() {

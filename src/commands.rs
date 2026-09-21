@@ -368,7 +368,7 @@ pub fn usage(live: bool) -> Result<()> {
         Observation::load()?
             .ok_or_else(|| anyhow!("no observation yet — run `cs start` (or `cs usage --live`)"))?
     };
-    for line in usage::format_lines(&obs, now) {
+    for line in usage::format_lines_colored(&obs, now, usage::colors_enabled()) {
         println!("{line}");
     }
     if !live {
