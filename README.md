@@ -66,6 +66,11 @@ it cannot write one account's tokens into another account's alias, and it fixes
 runs. `cs` also refuses to overwrite an alias whose saved account differs from
 the live login, so a mistaken login can never repoint an alias at someone else.
 
+Usage windows are colored in interactive terminals: green below 70%, yellow
+from 70% to below 90%, red from 90%, and bold red at 100% or above. Each window's
+percentage and reset countdown share its color. Piped output stays plain;
+`NO_COLOR=1` or `TERM=dumb` disables colors.
+
 ## Auto-switcher (Claude only)
 
 With two or more Claude subscriptions saved, `cs start` rotates them for you:
