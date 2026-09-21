@@ -33,8 +33,8 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn install_signal_handlers() {
     // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
 }
 
