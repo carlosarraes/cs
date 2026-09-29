@@ -13,6 +13,39 @@ build:
     cp target/release/{{binary_name}} {{install_dir}}/
     @echo "Installed {{binary_name}} -> {{install_dir}}/{{binary_name}}"
 
+# Build locally and install on an SSH host without a release (defaults to mac).
+[positional-arguments]
+sync host="mac": build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sync_host="$1"
+    if [[ ! "$sync_host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
+        echo "error: use an SSH host alias, hostname, or user@host" >&2
+        exit 1
+    fi
+    remote=$(ssh -o BatchMode=yes "$sync_host" 'uname -sm')
+    ssh -o BatchMode=yes "$sync_host" 'mkdir -p ~/.local/bin ~/.cache/cs-src'
+    if [ "$remote" = "$(uname -sm)" ]; then
+        scp -q target/release/{{binary_name}} "$sync_host":.cache/cs-src/cs-sync-binary
+        sync_binary='.cache/cs-src/cs-sync-binary'
+    else
+        echo "$sync_host is $remote; syncing source and building there"
+        rsync -az --delete \
+            --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' \
+            --exclude='*' -e 'ssh -o BatchMode=yes' ./ "$sync_host":.cache/cs-src/
+        ssh -o BatchMode=yes "$sync_host" 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/cs-src && cargo build --locked --release'
+        sync_binary='.cache/cs-src/target/release/cs'
+    fi
+    ssh -o BatchMode=yes "$sync_host" "bash -s -- $sync_binary" <<'SH'
+    set -euo pipefail
+    pending=$(mktemp "$HOME/.local/bin/.cs-sync.XXXXXX")
+    trap 'rm -f "$pending"' EXIT
+    install -m 755 "$HOME/$1" "$pending"
+    "$pending" --version
+    mv -f "$pending" "$HOME/.local/bin/cs"
+    echo "Installed $HOME/.local/bin/cs"
+    SH
+
 # Run tests
 test:
     cargo test
