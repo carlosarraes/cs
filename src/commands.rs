@@ -351,11 +351,66 @@ pub fn refresh_current_if_stale() -> Result<Option<String>> {
     Ok(Some(alias))
 }
 
+/// Refresh a token this long before it expires, so a poll never races expiry.
+const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
+
+fn saved_expires_at(data: &Value) -> Option<i64> {
+    data.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
+}
+
+/// Refresh the saved tokens of every non-current account whose access token has
+/// (nearly) expired, so their usage stays pollable. The current account is left
+/// to Claude Code. `skip` lets the daemon rate-limit retries per alias. Each
+/// success is saved immediately: the old refresh token is dead once exchanged.
+pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, Result<()>)>> {
+    let now_ms = usage::now() * 1000;
+    let due = |state: &State| -> Vec<String> {
+        let ps = state.claude();
+        ps.accounts
+            .iter()
+            .filter(|(alias, _)| ps.current.as_deref() != Some(alias.as_str()))
+            .filter(|(_, a)| {
+                saved_expires_at(&a.data).is_some_and(|t| t <= now_ms + REFRESH_MARGIN_MS)
+            })
+            .map(|(alias, _)| alias.clone())
+            .filter(|alias| !skip(alias))
+            .collect()
+    };
+    if due(&State::load()?).is_empty() {
+        return Ok(Vec::new());
+    }
+    let _lock = state::lock()?;
+    let mut state = State::load()?;
+    let mut results = Vec::new();
+    for alias in due(&state) {
+        let res = (|| -> Result<()> {
+            let acct = state
+                .claude_mut()
+                .accounts
+                .get_mut(&alias)
+                .ok_or_else(|| anyhow!("alias vanished"))?;
+            let oauth = acct
+                .data
+                .get("claudeAiOauth")
+                .ok_or_else(|| anyhow!("no claudeAiOauth saved"))?;
+            acct.data["claudeAiOauth"] = claude::refresh_oauth(oauth, now_ms)?;
+            state.save()
+        })();
+        results.push((alias, res));
+    }
+    Ok(results)
+}
+
 /// Show every Claude account's 5h/7d usage — from the daemon's last observation,
 /// or polled right now with `--live`.
 pub fn usage(live: bool) -> Result<()> {
     let now = usage::now();
     let obs = if live {
+        for (alias, res) in refresh_idle_expired(|_| false)? {
+            if let Err(e) = res {
+                eprintln!("{alias}: {e:#}");
+            }
+        }
         let state = State::load()?;
         let ps = state.claude();
         if ps.accounts.is_empty() {

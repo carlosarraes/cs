@@ -109,6 +109,8 @@ struct Loop {
     last_stay: Option<String>,
     last_config_err: Option<String>,
     last_warn: BTreeMap<&'static str, String>,
+    /// Alias → when its idle-token refresh last failed.
+    refresh_tried: BTreeMap<String, i64>,
 }
 
 impl Loop {
@@ -147,6 +149,7 @@ pub fn run() -> Result<()> {
         last_stay: None,
         last_config_err: None,
         last_warn: BTreeMap::new(),
+        refresh_tried: BTreeMap::new(),
     };
     log.log(
         "start",
@@ -202,6 +205,26 @@ fn tick(lp: &mut Loop, log: &mut Logger) -> Result<()> {
     }
 
     let now = usage::now();
+    let retry_gap = lp.cfg.auto_switcher.idle_poll_secs as i64;
+    let tried = lp.refresh_tried.clone();
+    match commands::refresh_idle_expired(|a| tried.get(a).is_some_and(|t| now - t < retry_gap)) {
+        Ok(results) => {
+            for (alias, res) in results {
+                match res {
+                    Ok(()) => {
+                        lp.refresh_tried.remove(&alias);
+                        log.log("info", &format!("{alias}: expired token refreshed"));
+                    }
+                    Err(e) => {
+                        lp.refresh_tried.insert(alias.clone(), now);
+                        log.log("warn", &format!("{alias}: could not refresh token: {e:#}"));
+                    }
+                }
+            }
+        }
+        Err(e) => log.log("warn", &format!("idle token refresh failed: {e:#}")),
+    }
+
     // Read-only here; the lock is taken only around the actual switch so a manual
     // `cs switch` never waits behind our network polls.
     let state = State::load()?;

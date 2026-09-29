@@ -18,7 +18,7 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// The Unknown reason for an expired stored token. The policy matches on this
 /// exact string to allow last-resort switches (Claude refreshes the token on
 /// first use once the account is current again).
-pub const TOKEN_EXPIRED: &str = "token expired (refreshes on next switch)";
+pub const TOKEN_EXPIRED: &str = "token expired";
 
 /// One rate-limit window as reported by the API.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +68,10 @@ pub struct Entry {
     /// Epoch seconds when this alias last stopped being current.
     #[serde(default)]
     pub last_active_at: Option<i64>,
+    /// The last Known usage and when it was fetched, kept while `reading` is
+    /// Unknown so the display can show stale numbers instead of nothing.
+    #[serde(default)]
+    pub last_known: Option<(Usage, i64)>,
 }
 
 impl Entry {
@@ -77,6 +81,7 @@ impl Entry {
             fetched_at: Some(fetched_at),
             backoff_until: None,
             last_active_at: None,
+            last_known: None,
         }
     }
 }
@@ -195,6 +200,12 @@ fn settle(polled: Polled, prev: Option<&Entry>, now: i64) -> Entry {
             entry.fetched_at = p.fetched_at;
         }
     }
+    if entry.reading.known().is_none() {
+        entry.last_known = prev.and_then(|p| match (&p.reading, p.fetched_at) {
+            (Reading::Known(u), Some(t)) => Some((u.clone(), t)),
+            _ => p.last_known.clone(),
+        });
+    }
     entry
 }
 
@@ -277,7 +288,16 @@ pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<Str
                         Some(t) if t > now => format!(", retry in {}", fmt_duration(t - now)),
                         _ => String::new(),
                     };
-                    vec![format!("?? {reason}{wait}")]
+                    let mut p = Vec::new();
+                    if let Some((u, t)) = &e.last_known {
+                        p.push(dim(format!("5h {:.0}%", u.five_hour.utilization), color));
+                        if let Some(w) = &u.seven_day {
+                            p.push(dim(format!("7d {:.0}%", w.utilization), color));
+                        }
+                        p.push(format!("as of {} ago", fmt_duration(now - t)));
+                    }
+                    p.push(format!("?? {reason}{wait}"));
+                    p
                 }
             };
             parts.push(since);
@@ -447,6 +467,14 @@ pub fn colors_enabled() -> bool {
     std::io::stdout().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
         && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
+fn dim(text: String, color: bool) -> String {
+    if color {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text
+    }
 }
 
 fn color_window(text: String, percent: f64, color: bool) -> String {
@@ -623,6 +651,38 @@ mod tests {
     }
 
     #[test]
+    fn unknown_poll_keeps_last_known_usage_for_display() {
+        let known = Entry::new(parse_usage(FIXTURE).map(Reading::Known).unwrap(), 1000);
+        let expired = || Polled::unknown(TOKEN_EXPIRED);
+        let e = settle(expired(), Some(&known), 1100);
+        assert!(e.reading.known().is_none());
+        let (u, t) = e.last_known.clone().unwrap();
+        assert_eq!(Some(&u), known.reading.known());
+        assert_eq!(t, 1000);
+        // Survives further Unknown polls, cleared by a Known one.
+        let e = settle(expired(), Some(&e), 1200);
+        assert_eq!(e.last_known.as_ref().map(|k| k.1), Some(1000));
+        let obs = Observation {
+            accounts: [("a".to_string(), e.clone())].into(),
+            ..Default::default()
+        };
+        let line = &format_lines(&obs, 1000 + 3600)[0];
+        assert!(
+            line.contains("as of 1h00m ago · ?? token expired"),
+            "{line}"
+        );
+        let e = settle(
+            Polled {
+                reading: known.reading.clone(),
+                retry_after: None,
+            },
+            Some(&e),
+            1300,
+        );
+        assert_eq!(e.last_known, None);
+    }
+
+    #[test]
     fn observation_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.json");
@@ -635,6 +695,7 @@ mod tests {
             "a".into(),
             Entry {
                 last_active_at: Some(90),
+                last_known: None,
                 ..Entry::new(Reading::Known(parse_usage(FIXTURE).unwrap()), 0)
             },
         );
@@ -642,6 +703,7 @@ mod tests {
             "b".into(),
             Entry {
                 last_active_at: None,
+                last_known: None,
                 ..Entry::new(Reading::Unknown { reason: "x".into() }, 0)
             },
         );
@@ -666,6 +728,7 @@ mod tests {
                 k.into(),
                 Entry {
                     last_active_at: if k == "c" { Some(10) } else { None },
+                    last_known: None,
                     ..Entry::new(Reading::Unknown { reason: "x".into() }, 0)
                 },
             );
@@ -707,6 +770,7 @@ mod tests {
             "aa".into(),
             Entry {
                 last_active_at: None,
+                last_known: None,
                 ..Entry::new(Reading::Known(parse_usage(FIXTURE).unwrap()), 0)
             },
         );
@@ -714,6 +778,7 @@ mod tests {
             "b".into(),
             Entry {
                 last_active_at: Some(now - 3 * 3600),
+                last_known: None,
                 ..Entry::new(
                     Reading::Unknown {
                         reason: "token expired".into(),

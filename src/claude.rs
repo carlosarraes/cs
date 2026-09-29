@@ -98,6 +98,77 @@ pub fn live_email() -> Result<Option<String>> {
     )
 }
 
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Exchange a saved `claudeAiOauth` payload's refresh token for fresh tokens,
+/// the same request Claude Code makes. Returns the payload with new tokens and
+/// expiry; other keys (`subscriptionType`, …) are kept. The server rotates the
+/// refresh token, so the result MUST be persisted or the account is logged out.
+pub fn refresh_oauth(oauth: &Value, now_ms: i64) -> Result<Value> {
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no refresh token saved"))?;
+    let scopes: Vec<&str> = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    });
+    if !scopes.is_empty() {
+        body["scope"] = json!(scopes.join(" "));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let resp = match agent
+        .post(TOKEN_URL)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r
+                .into_string()
+                .ok()
+                .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
+                .unwrap_or_default();
+            return Err(anyhow!("token refresh failed: HTTP {code} {detail}"));
+        }
+        Err(e) => return Err(anyhow!("token refresh failed: {e}")),
+    };
+    let resp: Value =
+        serde_json::from_str(&resp.into_string()?).context("parsing token refresh response")?;
+    apply_token_response(oauth, &resp, now_ms)
+}
+
+fn apply_token_response(oauth: &Value, resp: &Value, now_ms: i64) -> Result<Value> {
+    let access = resp
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("token refresh response has no access_token"))?;
+    let expires_in = resp
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("token refresh response has no expires_in"))?;
+    let mut out = oauth.clone();
+    out["accessToken"] = json!(access);
+    out["expiresAt"] = json!(now_ms + expires_in * 1000);
+    if let Some(rt) = resp.get("refresh_token").and_then(Value::as_str) {
+        out["refreshToken"] = json!(rt);
+    }
+    if let Some(scope) = resp.get("scope").and_then(Value::as_str) {
+        out["scopes"] = json!(scope.split_whitespace().collect::<Vec<_>>());
+    }
+    Ok(out)
+}
+
 /// Drive Claude Code's interactive login.
 pub fn login() -> Result<()> {
     let status = Command::new("claude")
@@ -345,5 +416,24 @@ mod tests {
     #[test]
     fn current_process_is_alive() {
         assert!(pid_alive(std::process::id() as i64));
+    }
+
+    #[test]
+    fn token_response_rotates_tokens_and_keeps_other_keys() {
+        let saved = json!({"accessToken": "a", "refreshToken": "r", "expiresAt": 1,
+            "scopes": ["x"], "subscriptionType": "max"});
+        let resp = json!({"access_token": "a2", "refresh_token": "r2", "expires_in": 3600,
+            "scope": "x y"});
+        let out = apply_token_response(&saved, &resp, 1000).unwrap();
+        assert_eq!(out["accessToken"], "a2");
+        assert_eq!(out["refreshToken"], "r2");
+        assert_eq!(out["expiresAt"], 1000 + 3_600_000);
+        assert_eq!(out["scopes"], json!(["x", "y"]));
+        assert_eq!(out["subscriptionType"], "max");
+        // No rotated refresh token in the response: keep the saved one.
+        let out = apply_token_response(&saved, &json!({"access_token": "b", "expires_in": 1}), 0)
+            .unwrap();
+        assert_eq!(out["refreshToken"], "r");
+        assert!(apply_token_response(&saved, &json!({}), 0).is_err());
     }
 }

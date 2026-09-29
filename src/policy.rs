@@ -300,6 +300,7 @@ mod tests {
     fn expired_token_is_last_resort_only() {
         let expired = |last: Option<i64>| Entry {
             last_active_at: last,
+            last_known: None,
             ..Entry::new(
                 Reading::Unknown {
                     reason: usage::TOKEN_EXPIRED.into(),
