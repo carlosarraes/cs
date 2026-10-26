@@ -1,8 +1,12 @@
+mod accounts;
 mod claude;
 mod commands;
 mod config;
 mod daemon;
+mod launch;
 mod policy;
+mod proxy;
+mod routing;
 mod snapshot;
 mod state;
 mod usage;
@@ -51,15 +55,22 @@ enum Commands {
     Whoami,
     /// Update a saved alias with the live credentials (after a `/login` outside cs)
     Refresh,
-    /// Show every Claude account's 5h/7d usage (from the daemon's last poll)
+    /// Show every Claude account's 5h/7d usage (from the router's last poll)
     Usage {
-        /// Poll the API right now instead of reading the daemon's last observation
+        /// Poll the API right now instead of reading the router's last observation
         #[arg(long)]
         live: bool,
     },
-    /// Run the auto-switcher in the foreground (Claude only)
+    /// Run the local Claude session router
     Start,
-    /// Print the auto-switcher log
+    /// Launch a Claude conversation through the session router
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Show live managed conversations and their accounts
+    Sessions,
+    /// Print the session router log
     Logs {
         /// Keep printing as new lines arrive
         #[arg(short, long)]
@@ -117,7 +128,9 @@ fn main() -> Result<()> {
         Commands::Whoami => commands::whoami(),
         Commands::Refresh => commands::refresh(),
         Commands::Usage { live } => commands::usage(live),
-        Commands::Start => daemon::run(),
+        Commands::Start => proxy::run(),
+        Commands::Run { args } => launch::run(args),
+        Commands::Sessions => launch::sessions(),
         Commands::Logs { follow } => daemon::logs(follow),
         Commands::Daemon {
             command: DaemonCommands::Install,

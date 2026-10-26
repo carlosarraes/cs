@@ -123,10 +123,6 @@ impl Observation {
     pub fn save_to(&self, path: &Path) -> Result<()> {
         util::atomic_write(path, &serde_json::to_vec_pretty(self)?)
     }
-
-    pub fn reading(&self, alias: &str) -> Option<&Reading> {
-        self.accounts.get(alias).map(|e| &e.reading)
-    }
 }
 
 /// Poll every saved Claude account. The current one is polled with the live
@@ -135,6 +131,12 @@ impl Observation {
 /// switch trigger and the usage API has a small request budget. An account that
 /// answered 429 is left alone until its `Retry-After` passes, carrying its last
 /// reading forward. `prev` also carries the running/idle timers.
+fn poll_oauth(account: &crate::state::Account, live: Option<&(String, Value)>) -> Option<Value> {
+    live.filter(|(email, _)| email == &account.email)
+        .and_then(|(_, data)| data.get("claudeAiOauth").cloned())
+        .or_else(|| account.data.get("claudeAiOauth").cloned())
+}
+
 pub fn observe(
     ps: &ProviderState,
     prev: Option<&Observation>,
@@ -146,7 +148,11 @@ pub fn observe(
         current: ps.current.clone(),
         ..Default::default()
     };
-    let live = claude::live_oauth().ok().flatten();
+    let live = if ps.current.is_some() {
+        claude::capture().ok()
+    } else {
+        None
+    };
     for (alias, acct) in &ps.accounts {
         let is_current = ps.current.as_deref() == Some(alias.as_str());
         let prev_entry = prev.and_then(|p| p.accounts.get(alias));
@@ -157,10 +163,7 @@ pub fn observe(
             obs.accounts.insert(alias.clone(), e.clone());
             continue;
         }
-        let oauth = match (&live, is_current) {
-            (Some(l), true) => Some(l.clone()),
-            _ => acct.data.get("claudeAiOauth").cloned(),
-        };
+        let oauth = poll_oauth(acct, if is_current { live.as_ref() } else { None });
         let polled = match oauth {
             Some(o) => poll(&o, now),
             None => Polled::unknown("no claudeAiOauth saved"),
@@ -238,6 +241,24 @@ pub fn carry_timers(prev: Option<&Observation>, obs: &mut Observation, now: i64)
 /// `* carraes  5h 45% (resets 2h14m) · 7d 12% (resets 4d2h) · running 3h02m`.
 /// Markers: `*` current, `-` other, `~` unknown. A window with no `resets_at`
 /// (idle account, no active session) shows just its percentage.
+pub fn format_lines_with_counts(
+    obs: &Observation,
+    now: i64,
+    color: bool,
+    counts: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    format_lines_colored(obs, now, color)
+        .into_iter()
+        .zip(obs.accounts.keys())
+        .map(
+            |(line, alias)| match counts.get(alias).filter(|n| **n > 0) {
+                Some(n) => format!("{line} ({n})"),
+                None => line,
+            },
+        )
+        .collect()
+}
+
 pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
     format_lines_colored(obs, now, false)
 }
@@ -261,13 +282,13 @@ pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<Str
             let is_current = obs.current.as_deref() == Some(alias.as_str());
             let since = if is_current {
                 match obs.current_since {
-                    Some(t) => format!("running {}", fmt_duration(now - t)),
-                    None => "running".into(),
+                    Some(t) => format!("manual login {}", fmt_duration(now - t)),
+                    None => "manual login".into(),
                 }
             } else {
                 match e.last_active_at {
-                    Some(t) => format!("idle {}", fmt_duration(now - t)),
-                    None => "idle".into(),
+                    Some(t) => format!("last manual login {} ago", fmt_duration(now - t)),
+                    None => "not selected manually".into(),
                 }
             };
             let marker = match &e.reading {
@@ -427,9 +448,13 @@ pub fn parse_usage(body: &str) -> Result<Usage> {
             resets_at: w.get("resets_at").and_then(Value::as_str).map(String::from),
         })
     };
+    let seven_day = window("seven_day");
+    if v.get("seven_day").is_some_and(|w| !w.is_null()) && seven_day.is_none() {
+        return Err(anyhow!("usage response has an invalid seven_day window"));
+    }
     Ok(Usage {
         five_hour: window("five_hour").ok_or_else(|| anyhow!("usage response has no five_hour"))?,
-        seven_day: window("seven_day"),
+        seven_day,
     })
 }
 
@@ -507,6 +532,62 @@ mod tests {
         "seven_day_opus": null,
         "extra_usage": {"is_enabled": false}
     }"#;
+
+    #[test]
+    fn drifted_live_login_cannot_supply_another_alias_usage() {
+        let account = crate::state::Account {
+            email: "a@x".into(),
+            data: serde_json::json!({"claudeAiOauth":{"accessToken":"a"}}),
+        };
+        let drifted = (
+            "b@x".into(),
+            serde_json::json!({"claudeAiOauth":{"accessToken":"b"}}),
+        );
+        assert_eq!(
+            poll_oauth(&account, Some(&drifted)).unwrap()["accessToken"],
+            "a"
+        );
+        let matching = (
+            "a@x".into(),
+            serde_json::json!({"claudeAiOauth":{"accessToken":"a-new"}}),
+        );
+        assert_eq!(
+            poll_oauth(&account, Some(&matching)).unwrap()["accessToken"],
+            "a-new"
+        );
+    }
+
+    #[test]
+    fn malformed_weekly_limit_is_not_unlimited_capacity() {
+        assert!(parse_usage(r#"{"five_hour":{"utilization":0},"seven_day":{}}"#).is_err());
+    }
+
+    #[test]
+    fn counts_are_independent_of_manual_login_marker() {
+        let mut obs = Observation {
+            current: Some("a".into()),
+            ..Default::default()
+        };
+        for alias in ["a", "b"] {
+            obs.accounts.insert(
+                alias.into(),
+                Entry::new(
+                    Reading::Known(Usage {
+                        five_hour: Window {
+                            utilization: 0.,
+                            resets_at: None,
+                        },
+                        seven_day: None,
+                    }),
+                    1000,
+                ),
+            );
+        }
+        let lines = format_lines_with_counts(&obs, 1000, false, &BTreeMap::from([("b".into(), 2)]));
+        assert!(lines[0].starts_with('*'));
+        assert!(!lines[0].ends_with("(2)"));
+        assert!(lines[1].ends_with("(2)"));
+    }
 
     #[test]
     fn usage_colors_each_window_by_its_own_quota() {
@@ -792,10 +873,14 @@ mod tests {
         assert!(lines[0].starts_with("* aa "), "{}", lines[0]);
         assert!(lines[0].contains("5h 5% (resets 1h00m)"), "{}", lines[0]);
         assert!(lines[0].contains("7d 0% (resets "), "{}", lines[0]);
-        assert!(lines[0].contains("running 3h00m"), "{}", lines[0]);
+        assert!(lines[0].contains("manual login 3h00m"), "{}", lines[0]);
         assert!(lines[1].starts_with("~ b  "), "{}", lines[1]);
         assert!(lines[1].contains("?? token expired"), "{}", lines[1]);
-        assert!(lines[1].contains("idle 3h00m"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("last manual login 3h00m ago"),
+            "{}",
+            lines[1]
+        );
     }
 
     #[test]

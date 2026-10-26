@@ -99,6 +99,7 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
 }
 
 pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
     validate_alias(alias)?;
     let _lock = state::lock()?;
     let mut state = State::load()?;
@@ -143,6 +144,7 @@ pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
 }
 
 pub fn switch(requested: &str, yes: bool) -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
     let _lock = state::lock()?;
     let mut state = State::load()?;
     let target = if requested == "next" {
@@ -175,13 +177,13 @@ fn next_target(ps: &ProviderState) -> Result<String> {
     // Fresh numbers for everyone (idle 0), but still honoring any 429 backoff.
     let obs = usage::observe(ps, Observation::load()?.as_ref(), usage::now(), 0);
     let current = ps.current.as_deref();
-    policy::pick_target(&obs, cfg.auto_switcher.ceiling, current)
+    policy::pick_target(&obs, cfg.routing.five_hour_ceiling as u8, current)
         .or_else(|| policy::pick_expired_fallback(&obs, current))
         .map(String::from)
         .ok_or_else(|| {
             anyhow!(
                 "no other account is known and below {}%:\n{}",
-                cfg.auto_switcher.ceiling,
+                cfg.routing.five_hour_ceiling as u8,
                 usage::format_lines(&obs, usage::now()).join("\n")
             )
         })
@@ -240,6 +242,7 @@ fn confirm_if_running() -> Result<bool> {
 }
 
 pub fn del(alias: &str) -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
     let _lock = state::lock()?;
     let mut state = State::load()?;
     let ps = state.claude_mut();
@@ -300,6 +303,7 @@ pub fn whoami() -> Result<()> {
 /// account's alias. Also fixes `current` when the live login drifted (a `/login`
 /// run outside cs).
 pub fn refresh() -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
     let _lock = state::lock()?;
     let mut state = State::load()?;
     let (email, data) = claude::capture()
@@ -329,6 +333,7 @@ pub fn refresh() -> Result<()> {
 /// newer. Returns the alias when it wrote. A live login belonging to a different
 /// account is left to the daemon's own identity warning.
 pub fn refresh_current_if_stale() -> Result<Option<String>> {
+    let _credentials = crate::accounts::credential_lock()?;
     let state = State::load()?;
     let Some(alias) = state.claude().current.clone() else {
         return Ok(None);
@@ -362,41 +367,67 @@ fn saved_expires_at(data: &Value) -> Option<i64> {
 /// (nearly) expired, so their usage stays pollable. The current account is left
 /// to Claude Code. `skip` lets the daemon rate-limit retries per alias. Each
 /// success is saved immediately: the old refresh token is dead once exchanged.
-pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, Result<()>)>> {
-    let now_ms = usage::now() * 1000;
-    let due = |state: &State| -> Vec<String> {
-        let ps = state.claude();
-        ps.accounts
-            .iter()
-            .filter(|(alias, _)| ps.current.as_deref() != Some(alias.as_str()))
-            .filter(|(_, a)| {
-                saved_expires_at(&a.data).is_some_and(|t| t <= now_ms + REFRESH_MARGIN_MS)
-            })
-            .map(|(alias, _)| alias.clone())
-            .filter(|alias| !skip(alias))
-            .collect()
+fn refresh_is_owned(
+    alias: &str,
+    current: Option<&str>,
+    account: &Account,
+    live: Option<&(String, Value)>,
+) -> bool {
+    let Some((email, data)) = live else {
+        return false;
     };
-    if due(&State::load()?).is_empty() {
+    let shared_token = ["accessToken", "refreshToken"].iter().any(|key| {
+        let saved = account.data["claudeAiOauth"][key]
+            .as_str()
+            .filter(|s| !s.is_empty());
+        saved.is_some() && saved == data["claudeAiOauth"][key].as_str()
+    });
+    current != Some(alias) && account.email != *email && !shared_token
+}
+
+pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, Result<()>)>> {
+    let _credentials = crate::accounts::credential_lock()?;
+    // Unmanaged clients cannot honor our lock. Never rotate their possible tokens.
+    if crate::accounts::unmanaged_claude_running() {
         return Ok(Vec::new());
     }
-    let _lock = state::lock()?;
-    let mut state = State::load()?;
+    let now_ms = usage::now() * 1000;
+    let initial = State::load()?;
+    let live = claude::capture().ok();
     let mut results = Vec::new();
-    for alias in due(&state) {
-        let res = (|| -> Result<()> {
-            let acct = state
-                .claude_mut()
-                .accounts
-                .get_mut(&alias)
-                .ok_or_else(|| anyhow!("alias vanished"))?;
-            let oauth = acct
+    for (alias, account) in &initial.claude().accounts {
+        if !refresh_is_owned(
+            alias,
+            initial.claude().current.as_deref(),
+            account,
+            live.as_ref(),
+        ) || skip(alias)
+            || !saved_expires_at(&account.data).is_some_and(|t| t <= now_ms + REFRESH_MARGIN_MS)
+        {
+            continue;
+        }
+        let result = (|| -> Result<()> {
+            let oauth = account
                 .data
                 .get("claudeAiOauth")
-                .ok_or_else(|| anyhow!("no claudeAiOauth saved"))?;
-            acct.data["claudeAiOauth"] = claude::refresh_oauth(oauth, now_ms)?;
-            state.save()
+                .ok_or_else(|| anyhow!("missing credentials"))?;
+            let refreshed = claude::refresh_oauth(oauth, now_ms)?;
+            let _lock = state::lock()?;
+            let mut latest = State::load()?;
+            let target = latest
+                .claude_mut()
+                .accounts
+                .get_mut(alias)
+                .ok_or_else(|| anyhow!("account removed during refresh"))?;
+            if target.email != account.email || target.data.get("claudeAiOauth") != Some(oauth) {
+                return Err(anyhow!(
+                    "credentials changed during refresh; refusing to overwrite them"
+                ));
+            }
+            target.data["claudeAiOauth"] = refreshed;
+            latest.save()
         })();
-        results.push((alias, res));
+        results.push((alias.clone(), result));
     }
     Ok(results)
 }
@@ -423,7 +454,8 @@ pub fn usage(live: bool) -> Result<()> {
         Observation::load()?
             .ok_or_else(|| anyhow!("no observation yet — run `cs start` (or `cs usage --live`)"))?
     };
-    for line in usage::format_lines_colored(&obs, now, usage::colors_enabled()) {
+    let counts = crate::routing::store::Store::default_path()?.update(|s| Ok(s.counts()))?;
+    for line in usage::format_lines_with_counts(&obs, now, usage::colors_enabled(), &counts) {
         println!("{line}");
     }
     if !live {
@@ -469,6 +501,28 @@ mod tests {
         ps.current = current.map(Into::into);
         ps.previous = previous.map(Into::into);
         ps
+    }
+
+    #[test]
+    fn refresh_excludes_actual_shared_identity_even_after_login_drift() {
+        let account = Account {
+            email: "b@x".into(),
+            data: json!({"claudeAiOauth":{"accessToken":"b","refreshToken":"rb"}}),
+        };
+        let live = ("b@x".into(), account.data.clone());
+        assert!(!refresh_is_owned("b", Some("a"), &account, Some(&live)));
+        assert!(!refresh_is_owned("b", None, &account, None));
+        let other = (
+            "c@x".into(),
+            json!({"claudeAiOauth":{"accessToken":"c","refreshToken":"rc"}}),
+        );
+        assert!(refresh_is_owned("b", Some("a"), &account, Some(&other)));
+        assert!(!refresh_is_owned("b", Some("b"), &account, Some(&other)));
+        let token_match = (
+            "unknown".into(),
+            json!({"claudeAiOauth":{"accessToken":"other","refreshToken":"rb"}}),
+        );
+        assert!(!refresh_is_owned("b", None, &account, Some(&token_match)));
     }
 
     #[test]

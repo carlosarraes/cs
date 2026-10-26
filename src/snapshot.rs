@@ -31,6 +31,8 @@ pub struct TmuxLoc {
 pub struct Sess {
     pub session_id: String,
     #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
     pub name: Option<String>,
     pub cwd: String,
     #[serde(default)]
@@ -215,6 +217,12 @@ pub fn take() -> Result<()> {
     if live.is_empty() {
         return Err(anyhow!("no Claude Code sessions are currently running"));
     }
+    let managed = crate::routing::store::Store::default_path()?.update(|s| {
+        Ok(s.leases
+            .values()
+            .filter_map(|l| l.root.clone())
+            .collect::<std::collections::BTreeSet<_>>())
+    })?;
     let panes = tmux_pane_map();
     let sessions: Vec<Sess> = live
         .into_iter()
@@ -225,6 +233,7 @@ pub fn take() -> Result<()> {
                 .and_then(pane_id_of)
                 .and_then(|p| panes.get(p).cloned());
             Sess {
+                managed: managed.contains(&l.session_id),
                 session_id: l.session_id,
                 name: l.name,
                 cwd: l.cwd,
@@ -415,6 +424,15 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
+fn resume_command(session: &Sess) -> String {
+    let launcher = if session.managed {
+        "cs run --"
+    } else {
+        "claude"
+    };
+    format!("{launcher} --resume {}", session.session_id)
+}
+
 pub fn restore(id: Option<&str>) -> Result<()> {
     let store = Store::load()?;
     let (id, snap) = match id {
@@ -450,7 +468,7 @@ pub fn restore(id: Option<&str>) -> Result<()> {
     if !tmux_available() {
         println!("tmux not available — run these yourself:");
         for s in &wanted {
-            println!("  cd {} && claude --resume {}", s.cwd, s.session_id);
+            println!("  cd {} && {}", s.cwd, resume_command(s));
         }
         return Ok(());
     }
@@ -511,13 +529,7 @@ pub fn restore(id: Option<&str>) -> Result<()> {
                 tmux(&["select-layout", "-t", &pane_ids[0], "tiled"])?;
             }
             for (pane, s) in pane_ids.iter().zip(&w.panes) {
-                tmux(&[
-                    "send-keys",
-                    "-t",
-                    pane,
-                    &format!("claude --resume {}", s.session_id),
-                    "Enter",
-                ])?;
+                tmux(&["send-keys", "-t", pane, &resume_command(s), "Enter"])?;
                 println!(
                     "* {}  →  tmux {}:{}",
                     window_name_for(s),
@@ -544,6 +556,7 @@ mod tests {
     fn sess(id: &str, name: &str, tmux: Option<(&str, u32, &str, u32)>) -> Sess {
         Sess {
             session_id: id.into(),
+            managed: false,
             name: (!name.is_empty()).then(|| name.to_string()),
             cwd: "/w".into(),
             tmux: tmux.map(|(s, wi, wn, pi)| TmuxLoc {
@@ -553,6 +566,20 @@ mod tests {
                 pane_index: pi,
             }),
         }
+    }
+
+    #[test]
+    fn legacy_and_managed_snapshots_resume_with_the_correct_launcher() {
+        let legacy: Sess = serde_json::from_str(r#"{"session_id":"example","cwd":"/w"}"#).unwrap();
+        assert_eq!(resume_command(&legacy), "claude --resume example");
+        let mut managed = legacy.clone();
+        managed.managed = true;
+        assert_eq!(resume_command(&managed), "cs run -- --resume example");
+        assert!(
+            serde_json::from_str::<Sess>(&serde_json::to_string(&managed).unwrap())
+                .unwrap()
+                .managed
+        );
     }
 
     #[test]

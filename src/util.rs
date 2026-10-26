@@ -3,7 +3,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -20,10 +23,26 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("cs");
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", process::id()));
-    fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
     Ok(())
 }
 

@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for Account {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProviderState {
     #[serde(default)]
     pub current: Option<String>,
@@ -92,11 +92,14 @@ impl State {
     }
 
     pub fn load() -> Result<State> {
-        let path = state_path()?;
+        Self::load_from(&state_path()?)
+    }
+
+    pub fn load_from(path: &Path) -> Result<State> {
         if !path.exists() {
             return Ok(State::default());
         }
-        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         parse(&bytes).with_context(|| format!("reading {}", path.display()))
     }
 
@@ -134,7 +137,7 @@ pub fn lock() -> Result<LockGuard> {
     lock_at(&state_path()?.with_file_name("state.lock"), true)
 }
 
-fn lock_at(path: &Path, block: bool) -> Result<LockGuard> {
+pub fn lock_at(path: &Path, block: bool) -> Result<LockGuard> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
