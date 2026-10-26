@@ -237,34 +237,31 @@ pub fn carry_timers(prev: Option<&Observation>, obs: &mut Observation, now: i64)
     }
 }
 
-/// One line per account, e.g.
-/// `* carraes  5h 45% (resets 2h14m) · 7d 12% (resets 4d2h) · running 3h02m`.
-/// Markers: `*` current, `-` other, `~` unknown. A window with no `resets_at`
-/// (idle account, no active session) shows just its percentage.
+pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
+    format_lines_colored(obs, now, false)
+}
+
+pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<String> {
+    format_lines_with_counts(obs, now, color, &BTreeMap::new())
+}
+
 pub fn format_lines_with_counts(
     obs: &Observation,
     now: i64,
     color: bool,
     counts: &BTreeMap<String, usize>,
 ) -> Vec<String> {
-    format_lines_colored(obs, now, color)
-        .into_iter()
-        .zip(obs.accounts.keys())
-        .map(
-            |(line, alias)| match counts.get(alias).filter(|n| **n > 0) {
-                Some(n) => format!("{line} ({n})"),
-                None => line,
-            },
-        )
-        .collect()
-}
-
-pub fn format_lines(obs: &Observation, now: i64) -> Vec<String> {
-    format_lines_colored(obs, now, false)
-}
-
-pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<String> {
-    let width = obs.accounts.keys().map(String::len).max().unwrap_or(0);
+    let labels: BTreeMap<_, _> = obs
+        .accounts
+        .keys()
+        .map(|alias| {
+            (
+                alias,
+                format!("{alias} ({})", counts.get(alias).copied().unwrap_or(0)),
+            )
+        })
+        .collect();
+    let width = labels.values().map(String::len).max().unwrap_or(0);
     let window = |label: &str, w: &Window| {
         let text = match &w.resets_at {
             Some(r) => format!(
@@ -290,11 +287,6 @@ pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<Str
                     Some(t) => format!("last manual login {} ago", fmt_duration(now - t)),
                     None => "not selected manually".into(),
                 }
-            };
-            let marker = match &e.reading {
-                _ if is_current => '*',
-                Reading::Known(_) => '-',
-                Reading::Unknown { .. } => '~',
             };
             let mut parts = match &e.reading {
                 Reading::Known(u) => {
@@ -325,7 +317,7 @@ pub fn format_lines_colored(obs: &Observation, now: i64, color: bool) -> Vec<Str
             if let Some(t) = e.fetched_at.filter(|t| now - t > 120) {
                 parts.push(format!("as of {} ago", fmt_duration(now - t)));
             }
-            format!("{marker} {alias:<width$}  {}", parts.join(" · "))
+            format!("{:<width$}  {}", labels[alias], parts.join(" · "))
         })
         .collect()
 }
@@ -563,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_are_independent_of_manual_login_marker() {
+    fn counts_follow_alias_and_are_independent_of_manual_login() {
         let mut obs = Observation {
             current: Some("a".into()),
             ..Default::default()
@@ -584,9 +576,8 @@ mod tests {
             );
         }
         let lines = format_lines_with_counts(&obs, 1000, false, &BTreeMap::from([("b".into(), 2)]));
-        assert!(lines[0].starts_with('*'));
-        assert!(!lines[0].ends_with("(2)"));
-        assert!(lines[1].ends_with("(2)"));
+        assert!(lines[0].starts_with("a (0)  5h"));
+        assert!(lines[1].starts_with("b (2)  5h"));
     }
 
     #[test]
@@ -838,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn format_lines_marks_current_and_unknown() {
+    fn format_lines_describes_manual_login_and_unknown_usage() {
         let t = parse_rfc3339(FIXTURE_RESET).unwrap();
         let now = t - 3600;
         let mut obs = Observation {
@@ -870,11 +861,11 @@ mod tests {
         );
         let lines = format_lines(&obs, now);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("* aa "), "{}", lines[0]);
+        assert!(lines[0].starts_with("aa (0)  "), "{}", lines[0]);
         assert!(lines[0].contains("5h 5% (resets 1h00m)"), "{}", lines[0]);
         assert!(lines[0].contains("7d 0% (resets "), "{}", lines[0]);
         assert!(lines[0].contains("manual login 3h00m"), "{}", lines[0]);
-        assert!(lines[1].starts_with("~ b  "), "{}", lines[1]);
+        assert!(lines[1].starts_with("b (0)   "), "{}", lines[1]);
         assert!(lines[1].contains("?? token expired"), "{}", lines[1]);
         assert!(
             lines[1].contains("last manual login 3h00m ago"),

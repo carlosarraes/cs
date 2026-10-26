@@ -181,6 +181,32 @@ pub fn login() -> Result<()> {
     Ok(())
 }
 
+pub fn read_profile_oauth(path: &std::path::Path) -> Result<Option<Value>> {
+    #[cfg(target_os = "macos")]
+    if let Some(value) = macos::read_profile(path)? {
+        return Ok(Some(value));
+    }
+    read_json_key(&path.join(".credentials.json"), "claudeAiOauth")
+}
+
+pub fn write_live_oauth(oauth: &Value) -> Result<()> {
+    write_active_oauth(oauth)
+}
+
+pub fn write_profile_oauth(path: &std::path::Path, oauth: &Value) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos::write_profile(path, oauth) {
+        // A new profile may use Claude's file fallback when SSH cannot create a Keychain item.
+        if macos::read_profile(path)?.is_some() {
+            return Err(error);
+        }
+    }
+    crate::util::atomic_write(
+        &path.join(".credentials.json"),
+        &serde_json::to_vec(&json!({"claudeAiOauth":oauth}))?,
+    )
+}
+
 // --- Active OAuth credential backend: file on Linux, Keychain on macOS --------
 
 #[cfg(not(target_os = "macos"))]
@@ -218,6 +244,33 @@ mod macos {
     const SERVICE: &str = "Claude Code-credentials";
     const NOT_FOUND_RC: i32 = 44; // errSecItemNotFound
     const STDIN_LINE_LIMIT: usize = 4096 - 64; // security -i reads stdin with a BUFSIZ fgets buffer
+
+    fn profile_service(path: &std::path::Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow!("profile path must be UTF-8"))?;
+        let digest = format!("{:x}", Sha256::digest(path.as_bytes()));
+        Ok(format!("{SERVICE}-{}", &digest[..8]))
+    }
+
+    pub fn read_profile(path: &std::path::Path) -> Result<Option<Value>> {
+        let Some(secret) = get(&account(), &profile_service(path)?)? else {
+            return Ok(None);
+        };
+        let value: Value =
+            serde_json::from_str(&secret).context("parsing native profile credentials")?;
+        Ok(value.get("claudeAiOauth").cloned())
+    }
+
+    pub fn write_profile(path: &std::path::Path, oauth: &Value) -> Result<()> {
+        let service = profile_service(path)?;
+        let existing = get(&account(), &service)?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?;
+        let value = patch_value(existing, "claudeAiOauth", oauth.clone())?;
+        set(&account(), &service, &serde_json::to_string(&value)?)
+    }
 
     pub fn read_oauth() -> Result<Option<Value>> {
         let Some(secret) = get(&account(), SERVICE)? else {

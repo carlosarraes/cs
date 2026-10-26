@@ -205,6 +205,16 @@ fn client() -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
+fn report_usage() -> Result<()> {
+    let Some(observation) = usage::Observation::load()? else {
+        return Ok(());
+    };
+    let counts = Store::default_path()?.update(|state| Ok(state.counts()))?;
+    let lines = usage::format_lines_with_counts(&observation, usage::now(), false, &counts);
+    crate::daemon::log_block("usage", &lines);
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let cfg = config::load()?.routing;
     let _service_lock = state::lock_at(&state::state_path()?.with_file_name("proxy.lock"), false)
@@ -233,7 +243,20 @@ pub fn run() -> Result<()> {
             upstream: "https://api.anthropic.com".into(),
         });
         let polling = tokio::spawn(async move {
+            let mut last_report = None;
             loop {
+                if cfg.report_secs > 0
+                    && last_report.is_none_or(|last: std::time::Instant| {
+                        last.elapsed() >= Duration::from_secs(cfg.report_secs)
+                    })
+                {
+                    match tokio::task::spawn_blocking(report_usage).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => crate::daemon::log("report", &error.to_string()),
+                        Err(error) => crate::daemon::log("report", &error.to_string()),
+                    }
+                    last_report = Some(std::time::Instant::now());
+                }
                 tokio::time::sleep(Duration::from_secs(cfg.poll_secs)).await;
                 if let Ok(Err(e)) = tokio::task::spawn_blocking(crate::accounts::poll).await {
                     crate::daemon::log("poll", &e.to_string());

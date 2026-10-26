@@ -2,8 +2,10 @@ mod accounts;
 mod claude;
 mod commands;
 mod config;
+mod conversation;
 mod daemon;
 mod launch;
+mod native;
 mod policy;
 mod proxy;
 mod routing;
@@ -61,13 +63,20 @@ enum Commands {
         #[arg(long)]
         live: bool,
     },
-    /// Run the local Claude session router
+    /// Poll/report account usage and serve existing proxy sessions
     Start,
-    /// Launch a Claude conversation through the session router
+    /// Launch Claude with an automatically selected native account
     Run {
+        /// Override automatic selection with a saved alias or email
+        #[arg(long)]
+        account: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
+    #[command(hide = true)]
+    NativeEvent,
+    #[command(hide = true)]
+    NativeMaintain { alias: String, email: String },
     /// Show live managed conversations and their accounts
     Sessions,
     /// Print the session router log
@@ -129,8 +138,10 @@ fn main() -> Result<()> {
         Commands::Refresh => commands::refresh(),
         Commands::Usage { live } => commands::usage(live),
         Commands::Start => proxy::run(),
-        Commands::Run { args } => launch::run(args),
+        Commands::Run { account, args } => launch::run(args, account.as_deref()),
         Commands::Sessions => launch::sessions(),
+        Commands::NativeEvent => launch::native_event(),
+        Commands::NativeMaintain { alias, email } => native::maintain_account(&alias, &email),
         Commands::Logs { follow } => daemon::logs(follow),
         Commands::Daemon {
             command: DaemonCommands::Install,
@@ -141,5 +152,39 @@ fn main() -> Result<()> {
             Some(SnapshotCommands::Restore { id }) => snapshot::restore(id.as_deref()),
             Some(SnapshotCommands::Del { id }) => snapshot::del(&id),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_parses_account_before_claude_arguments() {
+        let cli = Cli::try_parse_from([
+            "cs",
+            "run",
+            "--account",
+            "carlos@mondrio.io",
+            "--",
+            "claude",
+            "-p",
+            "say hi",
+        ])
+        .unwrap();
+        let Commands::Run { account, args } = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(account.as_deref(), Some("carlos@mondrio.io"));
+        assert_eq!(
+            args,
+            ["claude", "-p", "say hi"].map(std::ffi::OsString::from)
+        );
+        let cli = Cli::try_parse_from(["cs", "run", "--", "--chrome"]).unwrap();
+        let Commands::Run { account, args } = cli.command else {
+            panic!("expected run")
+        };
+        assert!(account.is_none());
+        assert_eq!(args, [std::ffi::OsString::from("--chrome")]);
     }
 }

@@ -78,6 +78,12 @@ pub fn log(kind: &str, msg: &str) {
         logger.log(kind, msg);
     }
 }
+pub fn log_block(kind: &str, lines: &[String]) {
+    if let Ok(mut logger) = Logger::open() {
+        logger.block(kind, lines);
+    }
+}
+
 /// `cs logs [-f]`: print the log, optionally following it like `tail -f`.
 pub fn logs(follow: bool) -> Result<()> {
     let path = log_path()?;

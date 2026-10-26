@@ -36,6 +36,7 @@ pub fn poll() -> Result<()> {
             crate::daemon::log("credentials", &format!("{alias}: {error}"));
         }
     }
+    crate::native::sync_all()?;
     let state = state::State::load()?;
     let previous = usage::Observation::load()?;
     let mut ps = state.claude().clone();

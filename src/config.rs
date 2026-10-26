@@ -16,6 +16,7 @@ pub struct Config {
 pub struct Routing {
     pub port: u16,
     pub poll_secs: u64,
+    pub report_secs: u64,
     pub max_usage_age_secs: u64,
     pub five_hour_ceiling: f64,
     pub weekly_ceiling: f64,
@@ -25,13 +26,14 @@ impl Default for Routing {
         Self {
             port: 18437,
             poll_secs: 60,
+            report_secs: 300,
             max_usage_age_secs: 300,
             five_hour_ceiling: 90.,
             weekly_ceiling: 95.,
         }
     }
 }
-pub const DEFAULT_TOML:&str="[routing]\nport = 18437\npoll_secs = 60\nmax_usage_age_secs = 300\nfive_hour_ceiling = 90\nweekly_ceiling = 95\n";
+pub const DEFAULT_TOML:&str="[routing]\nport = 18437\npoll_secs = 60\nreport_secs = 300\nmax_usage_age_secs = 300\nfive_hour_ceiling = 90\nweekly_ceiling = 95\n";
 pub fn config_home() -> Result<PathBuf> {
     Ok(match std::env::var_os("XDG_CONFIG_HOME") {
         Some(d) if !d.is_empty() && Path::new(&d).is_absolute() => PathBuf::from(d),

@@ -402,7 +402,7 @@ pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, 
             account,
             live.as_ref(),
         ) || skip(alias)
-            || !saved_expires_at(&account.data).is_some_and(|t| t <= now_ms + REFRESH_MARGIN_MS)
+            || saved_expires_at(&account.data).is_none_or(|t| t > now_ms + REFRESH_MARGIN_MS)
         {
             continue;
         }
@@ -430,6 +430,69 @@ pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, 
         results.push((alias.clone(), result));
     }
     Ok(results)
+}
+
+pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
+    let initial = State::load()?;
+    let account = initial
+        .claude()
+        .accounts
+        .get(alias)
+        .context("native account was removed")?;
+    if account.email != email {
+        return Err(anyhow!(
+            "{alias}: account identity changed; refusing credential renewal"
+        ));
+    }
+    let now_ms = usage::now() * 1000;
+    if saved_expires_at(&account.data).is_none_or(|time| time > now_ms + REFRESH_MARGIN_MS) {
+        return Ok(());
+    }
+    if crate::accounts::unmanaged_claude_running() {
+        return Err(anyhow!("cannot safely rotate credentials while unmanaged Claude processes may own the refresh grant; close those processes or refresh their login"));
+    }
+    let live = claude::capture()
+        .context("cannot verify shared login before renewing native credentials")?;
+    let shared = live.0 == account.email
+        && ["accessToken", "refreshToken"].iter().any(|key| {
+            let saved = account.data["claudeAiOauth"][key]
+                .as_str()
+                .filter(|s| !s.is_empty());
+            saved.is_some() && saved == live.1["claudeAiOauth"][key].as_str()
+        });
+    if !shared
+        && !refresh_is_owned(
+            alias,
+            initial.claude().current.as_deref(),
+            account,
+            Some(&live),
+        )
+    {
+        return Ok(());
+    }
+    // Verify write access before rotating the grant shared with the native login.
+    if shared {
+        claude::write_live_oauth(&live.1["claudeAiOauth"])?;
+    }
+    let original = &account.data["claudeAiOauth"];
+    let refreshed = claude::refresh_oauth(original, now_ms)?;
+    let _lock = state::lock()?;
+    let mut latest = State::load()?;
+    let target = latest
+        .claude_mut()
+        .accounts
+        .get_mut(alias)
+        .context("native account was removed during renewal")?;
+    if target.email != account.email || target.data["claudeAiOauth"] != *original {
+        return Err(anyhow!("native account credentials changed during renewal"));
+    }
+    target.data["claudeAiOauth"] = refreshed.clone();
+    latest.save()?;
+    if shared {
+        claude::write_live_oauth(&refreshed)?;
+    }
+    Ok(())
 }
 
 /// Show every Claude account's 5h/7d usage — from the daemon's last observation,
