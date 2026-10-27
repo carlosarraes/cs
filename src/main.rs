@@ -9,6 +9,7 @@ mod native;
 mod policy;
 mod proxy;
 mod routing;
+mod session_control;
 mod snapshot;
 mod state;
 mod usage;
@@ -42,8 +43,17 @@ enum Commands {
         /// Alias to switch to, `-` for the previous account, or `next` for the
         /// least-used (5h) account
         alias: String,
+        /// Move live managed conversations from this account to the destination
+        #[arg(long, conflicts_with = "session", group = "target")]
+        from: Option<String>,
+        /// Move only this live conversation (UUID from cs sessions)
+        #[arg(long, conflicts_with = "from", group = "target")]
+        session: Option<String>,
+        /// Interrupt selected conversations instead of waiting for Claude to become idle
+        #[arg(long, requires = "target")]
+        interrupt: bool,
         /// Switch even if Claude Code is running, without prompting
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with_all = ["from", "session"])]
         yes: bool,
     },
     /// Delete a saved alias (does not log out)
@@ -131,7 +141,19 @@ fn main() -> Result<()> {
             current,
             force,
         } => commands::add(&alias, current, force),
-        Commands::Switch { alias, yes } => commands::switch(&alias, yes),
+        Commands::Switch {
+            alias,
+            from,
+            session,
+            interrupt,
+            yes,
+        } => {
+            if from.is_some() || session.is_some() {
+                launch::switch_targeted(&alias, from.as_deref(), session.as_deref(), interrupt)
+            } else {
+                commands::switch(&alias, yes)
+            }
+        }
         Commands::Del { alias } => commands::del(&alias),
         Commands::List => commands::list(),
         Commands::Whoami => commands::whoami(),
@@ -158,6 +180,36 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_switch_selectors_do_not_change_plain_switch_parsing() {
+        let cli = Cli::try_parse_from(["cs", "switch", "b", "--from", "a"]).unwrap();
+        let Commands::Switch {
+            alias,
+            from,
+            session,
+            interrupt,
+            yes,
+        } = cli.command
+        else {
+            panic!("expected switch")
+        };
+        assert_eq!(alias, "b");
+        assert_eq!(from.as_deref(), Some("a"));
+        assert!(session.is_none() && !yes && !interrupt);
+        assert!(Cli::try_parse_from(["cs", "switch", "b", "--interrupt"]).is_err());
+        let cli = Cli::try_parse_from(["cs", "switch", "b", "--yes"]).unwrap();
+        let Commands::Switch {
+            from, session, yes, ..
+        } = cli.command
+        else {
+            panic!("expected switch")
+        };
+        assert!(from.is_none() && session.is_none() && yes);
+        assert!(
+            Cli::try_parse_from(["cs", "switch", "b", "--from", "a", "--session", "root"]).is_err()
+        );
+    }
 
     #[test]
     fn run_parses_account_before_claude_arguments() {

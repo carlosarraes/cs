@@ -101,6 +101,30 @@ launches; it remains available for usage polling/reports and older proxy clients
 Existing processes are not migrated, restarted, or switched by installing this
 version. Restart only the conversation you want to move to native authentication.
 
+To move running conversations launched by this version, target their current
+account or a conversation UUID from `cs sessions`:
+
+```sh
+cs switch carlos2 --from carlos3
+cs switch carlos2 --session <conversation-uuid>
+cs switch carlos2 --from carlos3 --interrupt
+```
+
+A targeted switch validates the destination and queues a restart of only the
+selected conversations, preserving their UUID, working directory, and supported
+launch flags. It leaves the shared login and other processes alone. By default
+it waits for Claude's idle notification (typically about a minute after a response,
+with no background agents). For a session waiting on a quota reset, use
+`--interrupt` to deliberately interrupt it and resume immediately.
+Check queued switches and failures with `cs sessions`; a queued message does
+not mean the move has completed. If the replacement fails before confirming its
+conversation, cs attempts to resume the original account.
+
+Older launchers, headless sessions, worktrees, changed working directories, and
+unsupported restart flags are rejected without stopping them. Reopen older
+sessions with the updated `cs run` before targeting them. Plain `cs switch <alias>`
+still changes the shared login and retains its existing warning.
+
 To choose a specific subscription, use an alias or its unique email:
 
 ```sh
@@ -124,7 +148,7 @@ file on Linux. Tokens are not passed in arguments or authentication environment
 variables. Conflicting auth variables and `apiKeyHelper` are removed for the child.
 `cs` owns refresh grants; profiles receive access credentials and reload updates.
 
-Each process stays on its chosen account and counts in `cs usage`/`cs sessions`.
+Each process stays on its chosen account unless explicitly targeted, and counts in `cs usage`/`cs sessions`.
 Bare, safe-mode, background, remote, cloud, and desktop launches are unsupported;
 managed runs require a local foreground process and enabled tracking hooks.
 Settings that disable tracking hooks are rejected. Close a conversation before

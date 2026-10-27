@@ -333,7 +333,15 @@ pub fn command(profile: &Path, mut args: Vec<OsString>) -> Result<NativeCommand>
         .context("cs executable path is not UTF-8")?
         .replace('\'', "'\"'\"'");
     let hook = json!({"hooks":[{"type":"command","command":format!("'{executable}' native-event"),"timeout":5}]});
-    for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "StopFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "Notification",
+    ] {
         if settings.get("hooks").is_none() {
             settings["hooks"] = json!({});
         }
