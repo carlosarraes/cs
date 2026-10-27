@@ -144,7 +144,9 @@ comparable subscription capacities; it does not predict how much a session
 will consume.
 
 The assignment stays for one hour after the conversation's last user prompt.
-Resuming within that period retains the account; after inactivity expiry,
+Resuming within that period prefers the account. If either quota window is at
+100%, an automatic resume selects another eligible account instead. Explicit
+`--account` pins still fail without fallback. After inactivity expiry,
 selection runs again at launch. Reopening or completing a response does not
 extend this timestamp. A running process and its subagents keep their account
 for their entire lifetime. There is no automatic account failover: an unavailable assigned

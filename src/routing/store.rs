@@ -102,9 +102,12 @@ impl Store {
                 bail!("conversation {root} is already running; close its existing process before resuming it");
             }
             let retained=s.retained(root,now(),AFFINITY_SECS);
+            if forced.is_none() && retained.is_some_and(|binding| accounts.claude().accounts.get(&binding.alias).is_none_or(|a|a.email!=binding.email)) {
+                bail!("assigned account identity changed or was removed; no fallback");
+            }
+            let retained=retained.filter(|binding| !quota_exhausted(entries.get(&binding.alias)));
             let alias=if let Some(alias)=forced {alias.to_string()}
             else if let Some(binding)=retained {
-                if accounts.claude().accounts.get(&binding.alias).is_none_or(|a|a.email!=binding.email){bail!("assigned account identity changed or was removed; no fallback");}
                 binding.alias.clone()
             } else {
                 let eligible=entries.iter().filter(|(alias,_)|accounts.claude().accounts.get(*alias).is_some_and(|a|token_valid(a,now()))).map(|(alias,entry)|(alias.clone(),entry.clone())).collect();
@@ -113,7 +116,7 @@ impl Store {
             };
             let account=accounts.claude().accounts.get(&alias).context("unknown selected account")?.clone();
             if !token_valid(&account,now()){bail!("{alias}: token expired or unavailable; no fallback");}
-            if entries.get(&alias).and_then(|e|e.reading.known()).is_some_and(|u|u.five_hour.utilization>=100. || u.seven_day.as_ref().is_some_and(|w|w.utilization>=100.)){bail!("{alias}: quota exhausted; no fallback");}
+            if quota_exhausted(entries.get(&alias)){bail!("{alias}: quota exhausted; no fallback");}
             let last_request=s.bindings.get(root).filter(|b|b.alias==alias && b.email==account.email).map_or(0,|b|b.last_request);
             s.bindings.insert(root.into(),Binding{alias:alias.clone(),email:account.email.clone(),last_request,in_flight:0});
             s.leases.get_mut(token).unwrap().root=Some(root.into());
@@ -269,6 +272,16 @@ impl Store {
         ))
     }
 }
+fn quota_exhausted(entry: Option<&Entry>) -> bool {
+    entry.and_then(|e| e.reading.known()).is_some_and(|usage| {
+        usage.five_hour.utilization >= 100.
+            || usage
+                .seven_day
+                .as_ref()
+                .is_some_and(|window| window.utilization >= 100.)
+    })
+}
+
 pub fn token_valid(account: &Account, time: i64) -> bool {
     let o = &account.data["claudeAiOauth"];
     o["accessToken"].as_str().is_some_and(|s| !s.is_empty())
@@ -399,6 +412,73 @@ mod tests {
         store.unregister(&second).unwrap();
         store.unregister(&duplicate).unwrap();
         assert!(store.update(|s| Ok(s.counts())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn automatic_resume_rebalances_at_either_quota_limit_but_explicit_pins_do_not() {
+        for weekly in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store {
+                path: dir.path().join("routing.json"),
+            };
+            let old = store.register().unwrap();
+            store
+                .reserve_native(
+                    &old,
+                    "pm",
+                    Some("a"),
+                    &accounts(),
+                    &entries(),
+                    &Routing::default(),
+                )
+                .unwrap();
+            store
+                .native_event(&old, "pm", "UserPromptSubmit", now())
+                .unwrap();
+            store.unregister(&old).unwrap();
+            let mut usage = entries();
+            let crate::usage::Reading::Known(value) = &mut usage.get_mut("a").unwrap().reading
+            else {
+                panic!("expected usage")
+            };
+            if weekly {
+                value.seven_day = Some(crate::usage::Window {
+                    utilization: 100.,
+                    resets_at: None,
+                });
+            } else {
+                value.five_hour.utilization = 100.;
+            }
+            let resumed = store.register().unwrap();
+            assert!(store
+                .reserve_native(
+                    &resumed,
+                    "pm",
+                    Some("a"),
+                    &accounts(),
+                    &usage,
+                    &Routing::default()
+                )
+                .is_err());
+            assert_eq!(
+                store
+                    .reserve_native(
+                        &resumed,
+                        "pm",
+                        None,
+                        &accounts(),
+                        &usage,
+                        &Routing::default()
+                    )
+                    .unwrap()
+                    .1,
+                "b"
+            );
+            assert_eq!(
+                store.update(|s| Ok(s.counts())).unwrap(),
+                BTreeMap::from([("b".into(), 1)])
+            );
+        }
     }
 
     #[test]
