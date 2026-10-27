@@ -202,8 +202,13 @@ fn spawn_managed(
         session.generation = uuid::Uuid::new_v4().to_string();
         command.env("CS_NATIVE_GENERATION", &session.generation);
         // Hooks acquire this lock too, so they cannot observe an unregistered child.
-        let child = RunningChild(command.spawn().context("launching Claude")?);
-        let process = Process::read(child.0.id()).context("Claude exited before registration")?;
+        let mut child = RunningChild(command.spawn().context("launching Claude")?);
+        let Some(process) = Process::read(child.0.id()) else {
+            if child.0.try_wait()?.is_some() {
+                return Ok(child);
+            }
+            bail!("could not register the running Claude process");
+        };
         session.child = Some(process.clone());
         store.update(|s| {
             s.leases
