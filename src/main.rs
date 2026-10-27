@@ -19,10 +19,23 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cs", version, about = "Switch between Claude Code accounts")]
+#[command(
+    name = "cs",
+    version,
+    about = "Route Claude sessions across accounts and manage account logins",
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true,
+    after_help = "Agent guide: cs --llm
+Examples: cs run -- --resume pm
+          cs switch work --from personal
+          cs switch work --session <UUID> --interrupt"
+)]
 struct Cli {
+    /// Print a compact agent guide with command examples and routing rules
+    #[arg(long)]
+    llm: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -38,10 +51,17 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
-    /// Switch to an alias (`-` = previous account, `next` = least-used 5h account)
+    /// Change the shared login, or move selected conversations to a destination account
+    #[command(after_help = "Targeted: cs switch DEST --from SOURCE
+          cs switch DEST --session UUID [--interrupt]
+Get UUIDs with cs sessions in another terminal; no restart needed.
+Without --interrupt, queue a restart after Claude's idle notification, typically
+about 60 seconds after its response with no background agents. Use --interrupt
+for sessions waiting for a quota reset. A restart resumes the same conversation.
+Only updated cs run launchers support targeted switching. Check cs sessions
+for pending moves or failures. Without a target, switch changes the shared login.")]
     Switch {
-        /// Alias to switch to, `-` for the previous account, or `next` for the
-        /// least-used (5h) account
+        /// Destination alias or, for targeted moves, email; plain switch also accepts - and next
         alias: String,
         /// Move live managed conversations from this account to the destination
         #[arg(long, conflicts_with = "session", group = "target")]
@@ -67,7 +87,7 @@ enum Commands {
     Whoami,
     /// Update a saved alias with the live credentials (after a `/login` outside cs)
     Refresh,
-    /// Show every Claude account's 5h/7d usage (from the router's last poll)
+    /// Show account session counts and cached 5h/7d usage; --live fetches now
     Usage {
         /// Poll the API right now instead of reading the router's last observation
         #[arg(long)]
@@ -77,7 +97,7 @@ enum Commands {
     Start,
     /// Launch Claude with an automatically selected native account
     Run {
-        /// Override automatic selection with a saved alias or email
+        /// Pin to an alias or unique email; fail if unavailable, never fall back
         #[arg(long)]
         account: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -87,7 +107,7 @@ enum Commands {
     NativeEvent,
     #[command(hide = true)]
     NativeMaintain { alias: String, email: String },
-    /// Show live managed conversations and their accounts
+    /// Show live conversation UUIDs, accounts, and pending switches or failures
     Sessions,
     /// Print the session router log
     Logs {
@@ -135,7 +155,14 @@ enum DaemonCommands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    if cli.llm {
+        print!("{}", include_str!("llm.md"));
+        return Ok(());
+    }
+    let Some(command) = cli.command else {
+        unreachable!("clap requires a command or --llm");
+    };
+    match command {
         Commands::Add {
             alias,
             current,
@@ -182,15 +209,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_guide_is_standalone_and_preserves_claude_flag_passthrough() {
+        let cli = Cli::try_parse_from(["cs", "--llm"]).unwrap();
+        assert!(cli.llm && cli.command.is_none());
+        assert!(Cli::try_parse_from(["cs"]).is_err());
+        assert!(Cli::try_parse_from(["cs", "--llm", "switch", "work"]).is_err());
+        assert!(Cli::try_parse_from(["cs", "switch", "work", "--llm"]).is_err());
+        let cli = Cli::try_parse_from(["cs", "run", "--", "--llm"]).unwrap();
+        let Some(Commands::Run { args, .. }) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args, [std::ffi::OsString::from("--llm")]);
+    }
+
+    #[test]
     fn targeted_switch_selectors_do_not_change_plain_switch_parsing() {
         let cli = Cli::try_parse_from(["cs", "switch", "b", "--from", "a"]).unwrap();
-        let Commands::Switch {
+        let Some(Commands::Switch {
             alias,
             from,
             session,
             interrupt,
             yes,
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected switch")
         };
@@ -199,9 +240,9 @@ mod tests {
         assert!(session.is_none() && !yes && !interrupt);
         assert!(Cli::try_parse_from(["cs", "switch", "b", "--interrupt"]).is_err());
         let cli = Cli::try_parse_from(["cs", "switch", "b", "--yes"]).unwrap();
-        let Commands::Switch {
+        let Some(Commands::Switch {
             from, session, yes, ..
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected switch")
         };
@@ -224,7 +265,7 @@ mod tests {
             "say hi",
         ])
         .unwrap();
-        let Commands::Run { account, args } = cli.command else {
+        let Some(Commands::Run { account, args }) = cli.command else {
             panic!("expected run")
         };
         assert_eq!(account.as_deref(), Some("carlos@mondrio.io"));
@@ -233,7 +274,7 @@ mod tests {
             ["claude", "-p", "say hi"].map(std::ffi::OsString::from)
         );
         let cli = Cli::try_parse_from(["cs", "run", "--", "--chrome"]).unwrap();
-        let Commands::Run { account, args } = cli.command else {
+        let Some(Commands::Run { account, args }) = cli.command else {
             panic!("expected run")
         };
         assert!(account.is_none());

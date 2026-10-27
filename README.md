@@ -25,6 +25,9 @@ From source: `cargo install --path .` or `just build`.
 
 ## Usage
 
+Run `cs --llm` for the compact agent guide, including routing rules and
+targeted-switch examples.
+
 ```sh
 cs add work              # run `claude auth login`, save the account as "work"
 cs add main --current    # save the already-logged-in account as "main"
