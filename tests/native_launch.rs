@@ -90,6 +90,60 @@ printf 'FAKE_CLAUDE_OK\n'
 }
 
 #[test]
+fn unavailable_unrelated_profile_does_not_block_a_healthy_launch() {
+    let f = Fixture::new();
+    let state_path = f.data.join("cs/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let mut other = state["providers"]["claude"]["accounts"]["a"].clone();
+    other["email"] = json!("b@x");
+    state["providers"]["claude"]["accounts"]["b"] = other;
+    fs::write(state_path, state.to_string()).unwrap();
+    let profile = f.data.join("cs/profiles/62");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(profile.join(".claude.json"), "unreadable profile").unwrap();
+    let output = f
+        .command()
+        .args(["run", "--account", "a", "--", "-p", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn usage_attempts_nonshared_renewal_with_unmanaged_process_and_unreadable_login() {
+    let f = Fixture::new();
+    let path = f.data.join("cs/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["providers"]["claude"]["accounts"]["a"]["data"]["claudeAiOauth"]["expiresAt"] = json!(1);
+    state["providers"]["claude"]["accounts"]["b"] = json!({
+        "email":"b@x", "data":{"oauthAccount":{"emailAddress":"b@x"},
+        "claudeAiOauth":{"accessToken":"expired-b","expiresAt":1}}
+    });
+    fs::write(path, state.to_string()).unwrap();
+    fs::write(f.source.join(".credentials.json"), "unreadable credentials").unwrap();
+    fs::create_dir(f.source.join("sessions")).unwrap();
+    fs::write(
+        f.source.join("sessions/unmanaged.json"),
+        json!({"pid":std::process::id()}).to_string(),
+    )
+    .unwrap();
+    let output = f.command().args(["usage", "--live"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("b: no refresh token saved"),
+        "renewal was skipped: {stderr}"
+    );
+    assert!(!stderr.contains("expired-b"));
+    assert!(!stderr.contains("a: no refresh token"));
+}
+
+#[test]
 fn automatic_launch_preserves_stdin_uses_native_auth_and_cleans_up() {
     let f = Fixture::new();
     let before = fs::read(f.source.join(".credentials.json")).unwrap();

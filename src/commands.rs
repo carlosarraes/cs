@@ -359,6 +359,13 @@ pub fn refresh_current_if_stale() -> Result<Option<String>> {
 /// Refresh a token this long before it expires, so a poll never races expiry.
 const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 
+fn renewal_login(
+    live: Option<(String, Value)>,
+    identity: Option<String>,
+) -> Option<(String, Value)> {
+    live.or_else(|| identity.map(|email| (email, serde_json::json!({}))))
+}
+
 fn saved_expires_at(data: &Value) -> Option<i64> {
     data.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
 }
@@ -387,13 +394,12 @@ fn refresh_is_owned(
 
 pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, Result<()>)>> {
     let _credentials = crate::accounts::credential_lock()?;
-    // Unmanaged clients cannot honor our lock. Never rotate their possible tokens.
-    if crate::accounts::unmanaged_claude_running() {
-        return Ok(Vec::new());
-    }
     let now_ms = usage::now() * 1000;
     let initial = State::load()?;
-    let live = claude::capture().ok();
+    let live = renewal_login(
+        claude::capture().ok(),
+        claude::configured_email().ok().flatten(),
+    );
     let mut results = Vec::new();
     for (alias, account) in &initial.claude().accounts {
         if !refresh_is_owned(
@@ -449,11 +455,11 @@ pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
     if saved_expires_at(&account.data).is_none_or(|time| time > now_ms + REFRESH_MARGIN_MS) {
         return Ok(());
     }
-    if crate::accounts::unmanaged_claude_running() {
-        return Err(anyhow!("cannot safely rotate credentials while unmanaged Claude processes may own the refresh grant; close those processes or refresh their login"));
-    }
-    let live = claude::capture()
-        .context("cannot verify shared login before renewing native credentials")?;
+    let live = renewal_login(
+        claude::capture().ok(),
+        claude::configured_email().ok().flatten(),
+    )
+    .context("cannot identify shared login before renewing credentials")?;
     let shared = live.0 == account.email
         && ["accessToken", "refreshToken"].iter().any(|key| {
             let saved = account.data["claudeAiOauth"][key]
@@ -469,7 +475,10 @@ pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
             Some(&live),
         )
     {
-        return Ok(());
+        return Err(anyhow!("{alias}: shared login credentials are unavailable or changed; refusing to rotate a different login's grant"));
+    }
+    if shared && crate::accounts::unmanaged_claude_running() {
+        return Err(anyhow!("{alias}: the shared login is owned by an unmanaged Claude process; waiting for its credential renewal"));
     }
     // Verify write access before rotating the grant shared with the native login.
     if shared {
@@ -564,6 +573,40 @@ mod tests {
         ps.current = current.map(Into::into);
         ps.previous = previous.map(Into::into);
         ps
+    }
+
+    #[test]
+    fn locked_shared_keychain_does_not_block_other_accounts() {
+        let account = Account {
+            email: "work@x".into(),
+            data: json!({"claudeAiOauth":{"accessToken":"work","refreshToken":"work-refresh"}}),
+        };
+        let live = renewal_login(None, Some("personal@x".into()));
+        assert!(refresh_is_owned(
+            "work",
+            Some("personal"),
+            &account,
+            live.as_ref()
+        ));
+        let shared = renewal_login(None, Some("work@x".into()));
+        assert!(!refresh_is_owned(
+            "work",
+            Some("personal"),
+            &account,
+            shared.as_ref()
+        ));
+        assert!(!refresh_is_owned(
+            "work",
+            Some("work"),
+            &account,
+            live.as_ref()
+        ));
+        assert!(!refresh_is_owned(
+            "work",
+            None,
+            &account,
+            renewal_login(None, None).as_ref()
+        ));
     }
 
     #[test]

@@ -209,11 +209,16 @@ pub fn sync_all() -> Result<()> {
         if !profile.exists() {
             continue;
         }
-        let config = read_json(&profile.join(".claude.json"))?;
-        if config["oauthAccount"]["emailAddress"].as_str() != Some(&account.email) {
-            continue;
+        let result = (|| -> Result<()> {
+            let config = read_json(&profile.join(".claude.json"))?;
+            if config["oauthAccount"]["emailAddress"].as_str() == Some(&account.email) {
+                sync_credentials(&profile, &account.data["claudeAiOauth"])?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("cs: {alias}: native profile synchronization unavailable: {error}");
         }
-        sync_credentials(&profile, &account.data["claudeAiOauth"])?;
     }
     Ok(())
 }

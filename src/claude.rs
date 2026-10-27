@@ -98,6 +98,17 @@ pub fn live_email() -> Result<Option<String>> {
     )
 }
 
+pub fn configured_email() -> Result<Option<String>> {
+    Ok(
+        read_json_key(&global_config_path()?, "oauthAccount")?.and_then(|a| {
+            a["emailAddress"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        }),
+    )
+}
+
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 

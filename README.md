@@ -189,10 +189,13 @@ cs logs -f
 The service polls saved accounts with backoff. Managed launches also maintain
 credentials without requiring the service. Renewal preserves the selected account;
 it never switches identity. To avoid competing refresh-token rotations, renewal
-pauses when unmanaged Claude processes may own a grant, or when the shared login
-cannot be inspected safely. A near-expiry renewal failure names the account on
+pauses for the shared login while unmanaged Claude processes may own its grant.
+Other saved accounts renew independently; identifying the shared login does not
+require an unlocked Keychain. If both the shared identity and credentials are
+unavailable, renewal pauses instead of guessing. A near-expiry renewal failure names the account on
 stderr. Close unmanaged processes or renew their login and run `cs refresh` if
-needed. Independent credential managers do not participate in cs's locks.
+needed. Do not give the same saved refresh grant to an independent credential manager;
+it cannot participate in cs's locks.
 An already-started renewal can finish persisting its token after its conversation
 exits; closing a conversation does not cancel a grant exchange midway.
 
