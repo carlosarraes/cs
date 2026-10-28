@@ -53,8 +53,9 @@ An exhausted/unusable destination is rejected. If the replacement fails before
 confirming the conversation, cs attempts to restore the original account.
 
 Only sessions launched by a version supporting targeted switching can be moved.
-Older launchers must be reopened once. Headless runs, worktrees, changed working
-directories, and unsupported restart flags cannot be moved automatically.
+Older launchers must be reopened once. Headless runs, worktrees, and unsupported
+restart flags cannot be moved automatically. Normal shell directory changes are
+supported; restarts use the original launch project to preserve relative flags.
 Other sessions and the shared login are unaffected by targeted moves.
 
 ## Shared login and account maintenance

@@ -56,6 +56,15 @@ impl Controls {
         };
         let before = serde_json::to_vec(&sessions)?;
         sessions.retain(|_, session| session.owner.alive());
+        for session in sessions.values_mut() {
+            if session.unsupported.as_deref() == Some("conversation changed working directory; restart it manually on the target account") {
+                session.unsupported = if session.owner.has_terminal_stdin() {
+                    None
+                } else {
+                    Some("cannot verify interactive launcher stdin; reopen with cs run in a terminal".into())
+                };
+            }
+        }
         let result = f(&mut sessions)?;
         let after = serde_json::to_vec(&sessions)?;
         if before != after {
@@ -128,7 +137,6 @@ impl Controls {
                 bail!("event belongs to a previous Claude process");
             }
             let agent = payload["agent_id"].as_str();
-            let cwd = payload["cwd"].as_str();
             if kind == "SubagentStart" {
                 session.agents.insert(agent.context("missing subagent identity")?.into());
                 return Ok(());
@@ -168,11 +176,6 @@ impl Controls {
             if session.root != root {
                 if session.request.take().is_some() { session.error = Some("switch canceled because the conversation changed".into()); }
                 session.root = root.into();
-            }
-            if let Some(cwd) = cwd {
-                if std::fs::canonicalize(cwd).ok() != std::fs::canonicalize(&session.cwd).ok() {
-                    session.unsupported = Some("conversation changed working directory; restart it manually on the target account".into());
-                }
             }
             match kind {
                 "UserPromptSubmit" => session.busy = true,
@@ -277,6 +280,41 @@ mod tests {
             email: "b@x".into(),
         }
     }
+    #[test]
+    fn legacy_directory_blocker_cannot_enable_a_noninteractive_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let controls = Controls {
+            path: dir.path().join("controls.json"),
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut changed = session("a", "one");
+        changed.owner = Process::read(child.id()).unwrap();
+        changed.unsupported = Some(
+            "conversation changed working directory; restart it manually on the target account"
+                .into(),
+        );
+        let mut headless = session("a", "two");
+        headless.unsupported = Some("headless sessions cannot be switched while running".into());
+        std::fs::write(
+            &controls.path,
+            serde_json::to_vec(&BTreeMap::from([("one", changed), ("two", headless)])).unwrap(),
+        )
+        .unwrap();
+        controls
+            .update(|s| {
+                assert!(s["one"].unsupported.is_some());
+                assert!(s["two"].unsupported.is_some());
+                Ok(())
+            })
+            .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[test]
     fn batch_validation_never_queues_a_partial_move() {
         let dir = tempfile::tempdir().unwrap();

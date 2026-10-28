@@ -13,6 +13,9 @@ impl Process {
     pub fn read(pid: u32) -> Option<Self> {
         process_start(pid).map(|start| Self { pid, start })
     }
+    pub fn has_terminal_stdin(&self) -> bool {
+        self.alive() && terminal_stdin(self.pid) && self.alive()
+    }
     pub fn alive(&self) -> bool {
         Self::read(self.pid).as_ref() == Some(self)
     }
@@ -53,6 +56,49 @@ fn process_start(pid: u32) -> Option<String> {
         "{}:{}",
         info.pbi_start_tvsec, info.pbi_start_tvusec
     ))
+}
+#[cfg(target_os = "linux")]
+fn terminal_stdin(pid: u32) -> bool {
+    use std::{io::IsTerminal, os::unix::fs::OpenOptionsExt};
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(format!("/proc/{pid}/fd/0"))
+        .is_ok_and(|file| file.is_terminal())
+}
+#[cfg(target_os = "macos")]
+fn terminal_stdin(pid: u32) -> bool {
+    use std::{io::IsTerminal, os::unix::fs::OpenOptionsExt};
+    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+        .args([
+            "-b",
+            "-n",
+            "-P",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "0",
+            "-Fn",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|path| path.starts_with("/dev/"))
+        .any(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .open(path)
+                .is_ok_and(|file| file.is_terminal())
+        })
 }
 #[cfg(test)]
 mod tests {

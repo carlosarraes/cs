@@ -262,6 +262,10 @@ fn prepare_move(
     source: &std::path::Path,
     token: &str,
 ) -> Result<MovePreparation> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        bail!("headless sessions cannot be switched while running");
+    }
     if let Some(reason) = &session.unsupported {
         bail!("{reason}");
     }
@@ -270,15 +274,23 @@ fn prepare_move(
     if alias != target.alias || account.email != target.email {
         bail!("destination account identity changed; switch canceled");
     }
+    if !std::fs::metadata(&session.cwd)
+        .context("original project directory is unavailable; session was not stopped")?
+        .is_dir()
+    {
+        bail!("original project directory is not a directory; session was not stopped");
+    }
     let resumed = crate::session_control::resume_args(args, &session.root)?;
     let profile = crate::native::prepare(&alias, &account, source)?;
     crate::native::verify(&profile, &alias, &account.email)?;
     let mut next = crate::native::command(&profile, resumed.clone())?;
-    next.env("CS_NATIVE_LEASE", token);
+    next.env("CS_NATIVE_LEASE", token).current_dir(&session.cwd);
     let original_profile = crate::native::profile_path(&session.alias)?;
     crate::native::verify(&original_profile, &session.alias, &session.email)?;
     let mut rollback = crate::native::command(&original_profile, resumed)?;
-    rollback.env("CS_NATIVE_LEASE", token);
+    rollback
+        .env("CS_NATIVE_LEASE", token)
+        .current_dir(&session.cwd);
     Ok(MovePreparation {
         target,
         root: session.root.clone(),

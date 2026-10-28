@@ -281,7 +281,7 @@ if 'auth' in args:
  print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty','email':email}));sys.exit(0)
 root=args[args.index('--resume')+1] if '--resume' in args else args[args.index('--session-id')+1]
 test=pathlib.Path(os.environ['TEST_CONTROL_DIR'])
-with (test/'launches.jsonl').open('a') as out:out.write(json.dumps({'root':root,'email':email,'pid':os.getpid(),'args':args})+'\n')
+with (test/'launches.jsonl').open('a') as out:out.write(json.dumps({'root':root,'email':email,'pid':os.getpid(),'args':args,'cwd':os.getcwd()})+'\n')
 if email=='b@x' and (test/'fail-destination').exists():sys.exit(17)
 def event(name,agent=None,notification=None):
  data={'session_id':root,'hook_event_name':name,'cwd':os.getcwd()}
@@ -290,6 +290,7 @@ def event(name,agent=None,notification=None):
  r=subprocess.run([os.environ['TEST_CS_BINARY'],'native-event'],input=json.dumps(data),text=True,capture_output=True)
  if r.returncode:sys.exit(21)
  return r.stdout
+if email=='a@x' and (test/'change-directory').exists():os.chdir(test/'frontend')
 assert not event('SessionStart')
 busy=os.environ.get('TEST_BUSY')=='yes' and email=='a@x'
 if not busy:event('Notification',notification='idle_prompt')
@@ -627,4 +628,58 @@ fn explicit_interrupt_moves_busy_session_and_rejects_stale_child_hooks() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("previous Claude process"));
     assert_eq!(controls(&f)[token]["alias"], "b");
     assert_eq!(controls(&f)[token]["root"], old["root"]);
+}
+
+#[test]
+fn shell_directory_changes_do_not_block_targeted_resume_in_launch_project() {
+    let f = interactive_fixture();
+    fs::create_dir(f.temp.path().join("frontend")).unwrap();
+    fs::write(f.temp.path().join("change-directory"), "").unwrap();
+    let _one = start_interactive(&f, "a", false);
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v["busy"] == false)
+    });
+    let original = controls(&f);
+    let (token, session) = original.as_object().unwrap().iter().next().unwrap();
+    assert!(
+        session["unsupported"].is_null(),
+        "{}",
+        session["unsupported"]
+    );
+    let path = f.data.join("cs/session-controls.json");
+    let mut legacy = controls(&f);
+    legacy[token]["unsupported"] =
+        json!("conversation changed working directory; restart it manually on the target account");
+    fs::write(path, legacy.to_string()).unwrap();
+    let output = f
+        .command()
+        .args([
+            "switch",
+            "b",
+            "--session",
+            session["root"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until(&f, || controls(&f)[token]["alias"] == "b");
+    let launches = fs::read_to_string(f.temp.path().join("launches.jsonl")).unwrap();
+    let resumed: Value = launches
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["email"] == "b@x")
+        .unwrap();
+    assert_eq!(resumed["root"], session["root"]);
+    assert_eq!(
+        PathBuf::from(resumed["cwd"].as_str().unwrap()),
+        fs::canonicalize(f.temp.path()).unwrap()
+    );
 }

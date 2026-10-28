@@ -123,8 +123,10 @@ Check queued switches and failures with `cs sessions`; a queued message does
 not mean the move has completed. If the replacement fails before confirming its
 conversation, cs attempts to resume the original account.
 
-Older launchers, headless sessions, worktrees, changed working directories, and
-unsupported restart flags are rejected without stopping them. Reopen older
+Normal shell directory changes do not prevent switching; the replacement starts
+from the original launch project so relative flags keep their meaning.
+
+Older launchers, headless sessions, worktrees, and unsupported restart flags are rejected without stopping them. Reopen older
 sessions with the updated `cs run` before targeting them. Plain `cs switch <alias>`
 still changes the shared login and retains its existing warning.
 
