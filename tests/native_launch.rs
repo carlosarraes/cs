@@ -45,6 +45,7 @@ if [ -n "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN$ANTHROP
 case " $* " in
  *" auth status "*) printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"a@x"}'; exit 0;;
 esac
+printf '%s\n' "$@" > "$TEST_ARGS"
 printf '%s\n' "$$" > "$TEST_CHILD_PID"
 if [ "$TEST_WAIT" = yes ]; then
  trap 'echo interrupt >> "$TEST_SIGNALS"' INT
@@ -80,6 +81,7 @@ printf 'FAKE_CLAUDE_OK\n'
             )
             .env("ANTHROPIC_API_KEY", "wrong-account-key")
             .env("CLAUDE_CODE_OAUTH_TOKEN", "wrong-account-token")
+            .env("TEST_ARGS", self.temp.path().join("args"))
             .env("TEST_CHILD_PID", self.temp.path().join("child.pid"))
             .env("TEST_SIGNALS", self.temp.path().join("signals"));
         cmd
@@ -682,4 +684,105 @@ fn shell_directory_changes_do_not_block_targeted_resume_in_launch_project() {
         PathBuf::from(resumed["cwd"].as_str().unwrap()),
         fs::canonicalize(f.temp.path()).unwrap()
     );
+}
+
+#[test]
+fn utility_commands_use_pinned_identity_without_quota_or_conversation() {
+    for command in [vec!["mcp", "list"], vec!["--version"], vec!["--help"]] {
+        let f = Fixture::new();
+        fs::write(f.data.join("cs/usage.json"),json!({"observed_at":chrono::Utc::now().timestamp(),"accounts":{"a":{"reading":{"status":"known","five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":100,"resets_at":null}},"fetched_at":chrono::Utc::now().timestamp()}}}).to_string()).unwrap();
+        let before = fs::read(f.source.join(".credentials.json")).unwrap();
+        let output = f
+            .command()
+            .args(["run", "--account", "a", "--"])
+            .args(&command)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = fs::read_to_string(f.temp.path().join("args")).unwrap();
+        assert!(
+            !args.contains("--session-id") && !args.contains("--resume"),
+            "{args}"
+        );
+        assert!(args.starts_with(command[0]));
+        assert!(!f.data.join("cs/routing.json").exists());
+        assert_eq!(
+            fs::read(f.source.join(".credentials.json")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn prompts_do_not_bypass_quota_by_containing_utility_names() {
+    for args in [vec!["-p", "mcp"], vec!["config"], vec!["-p", "--version"]] {
+        let f = Fixture::new();
+        fs::write(f.data.join("cs/usage.json"),json!({"observed_at":chrono::Utc::now().timestamp(),"accounts":{"a":{"reading":{"status":"known","five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":100,"resets_at":null}},"fetched_at":chrono::Utc::now().timestamp()}}}).to_string()).unwrap();
+        let output = f
+            .command()
+            .args(["run", "--account", "a", "--"])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("weekly quota exhausted"));
+        assert!(!f.temp.path().join("child.pid").exists());
+    }
+}
+
+#[test]
+fn utility_commands_ignore_missing_usage_but_reject_missing_accounts() {
+    let f = Fixture::new();
+    fs::remove_file(f.data.join("cs/usage.json")).unwrap();
+    let output = f
+        .command()
+        .args(["run", "--", "mcp", "list"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_file(f.temp.path().join("child.pid")).unwrap();
+    let output = f
+        .command()
+        .args(["run", "--account", "missing", "--", "mcp", "list"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown account"));
+    assert!(!f.temp.path().join("child.pid").exists());
+}
+
+#[test]
+fn utility_commands_refuse_expired_credentials_without_fallback() {
+    let f = Fixture::new();
+    let path = f.data.join("cs/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["providers"]["claude"]["accounts"]["a"]["data"]["claudeAiOauth"] =
+        json!({"accessToken":"expired-secret","expiresAt":1});
+    fs::write(path, state.to_string()).unwrap();
+    fs::write(
+        f.source.join(".credentials.json"),
+        json!({"claudeAiOauth":{"accessToken":"expired-secret","expiresAt":1}}).to_string(),
+    )
+    .unwrap();
+    let output = f
+        .command()
+        .args(["run", "--account", "a", "--", "mcp", "list"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("expired-secret"));
+    assert!(!f.temp.path().join("child.pid").exists());
 }

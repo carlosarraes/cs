@@ -31,6 +31,9 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
     if let Some(name) = requested {
         resolve_account(&state::State::load()?, name).map(|_| ())?;
     }
+    if utility_command(&args) {
+        return run_utility(args, requested);
+    }
     let source = crate::native::source_config()?;
     let root = crate::conversation::resolve(&mut args, &source, &std::env::current_dir()?)?;
     crate::conversation::ensure_not_running(&root, &source)?;
@@ -162,6 +165,55 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
         Ok(())
     });
     result.and(cleanup).and(controls_cleanup)
+}
+
+fn utility_command(args: &[OsString]) -> bool {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("mcp" | "doctor") => true,
+        Some("auth") => args.get(1).is_some_and(|a| a == "status"),
+        Some("--version" | "-v" | "--help" | "-h") => args.len() == 1,
+        _ => false,
+    }
+}
+
+fn run_utility(args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
+    let saved = state::State::load()?;
+    let name = requested
+        .or(saved.claude().current.as_deref())
+        .context("no selected account; use cs run --account <alias> -- <command>")?;
+    let (alias, account) = resolve_account(&saved, name)?;
+    crate::commands::renew_native_account(alias, &account.email)
+        .with_context(|| format!("{alias}: credentials unavailable; no fallback"))?;
+    let updated = state::State::load()?;
+    let current = updated
+        .claude()
+        .accounts
+        .get(alias)
+        .context("account was removed")?;
+    if current.email != account.email {
+        bail!("{alias}: account identity changed; no fallback");
+    }
+    if !crate::routing::store::token_valid(current, crate::usage::now()) {
+        bail!("{alias}: token expired or unavailable; refresh this account; no fallback");
+    }
+    let source = crate::native::source_config()?;
+    let profile = crate::native::prepare(alias, current, &source)?;
+    crate::native::verify(&profile, alias, &current.email)?;
+    let mut command = crate::native::command(&profile, args)?;
+    command
+        .env_remove("CS_NATIVE_LEASE")
+        .env_remove("CS_NATIVE_GENERATION");
+    eprintln!(
+        "cs: {alias} ({}) — utility command; no model quota required",
+        current.email
+    );
+    let status = command
+        .status()
+        .context("launching Claude utility command")?;
+    if !status.success() {
+        bail!("{alias}: Claude exited with {status}; no account fallback");
+    }
+    Ok(())
 }
 
 struct RunningChild(std::process::Child);

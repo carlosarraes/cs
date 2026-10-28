@@ -82,3 +82,10 @@ cs snapshot restore     # Reopen newest snapshot in tmux
 cs snapshot --help      # Snapshot subcommands
 
 Use cs <command> --help for detailed flags. Never print or copy account tokens.
+
+Non-model utilities: `cs run --account ALIAS -- mcp list` bypasses model quota,
+including at 100% weekly usage. Supported utility prefixes: mcp, doctor, auth status;
+also standalone --help/-h and --version/-v. Put the command first after --.
+Pins retain credential/identity checks with no fallback. Without --account, use the
+currently selected account. Utilities create no conversation or session count.
+Other arguments use normal quota admission; config is not a Claude subcommand.

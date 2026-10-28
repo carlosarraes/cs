@@ -121,6 +121,15 @@ content, project settings, and ordinary Claude flags, including named resume:
 cs run -- --dangerously-skip-permissions --chrome --resume "pm"
 ```
 
+Non-model utility commands can run even when the account has exhausted its model
+quota: `cs run --account carlos -- mcp list`. This applies to `mcp`, `doctor`,
+`auth status`, and standalone `--help`/`-h` or `--version`/`-v`. They use the pinned
+account, or the currently selected account when unpinned, without creating a
+conversation or contributing to session counts. Credentials and native identity
+are still checked. Put the utility command first after `--`. Other arguments
+keep the normal model quota checks; `config` is not a subcommand in the installed
+Claude CLI.
+
 No `cs switch` or explicit account is needed. `cs start` is optional for new
 launches; it remains available for usage polling/reports and older proxy clients.
 Existing processes are not migrated, restarted, or switched by installing this
