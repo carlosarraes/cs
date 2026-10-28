@@ -14,6 +14,7 @@ build:
     @echo "Installed {{binary_name}} -> {{install_dir}}/{{binary_name}}"
 
 # Build locally and install on an SSH host without a release (defaults to mac).
+# mac and mact get a binary built on mact; the Mac itself never compiles.
 [positional-arguments]
 sync host="mac": build
     #!/usr/bin/env bash
@@ -22,6 +23,33 @@ sync host="mac": build
     if [[ ! "$sync_host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
         echo "error: use an SSH host alias, hostname, or user@host" >&2
         exit 1
+    fi
+    install_on() {
+        ssh -o BatchMode=yes "$1" "bash -s -- $2" <<'SH'
+    set -euo pipefail
+    pending=$(mktemp "$HOME/.local/bin/.cs-sync.XXXXXX")
+    trap 'rm -f "$pending"' EXIT
+    install -m 755 "$HOME/$1" "$pending"
+    "$pending" --version
+    mv -f "$pending" "$HOME/.local/bin/cs"
+    echo "Installed $HOME/.local/bin/cs"
+    SH
+    }
+    # The Mac is under heavy load, so it never compiles: mact has the same
+    # Apple chip, builds in its ~/projs/cs clone, and the binary is copied over.
+    if [ "$sync_host" = mac ] || [ "$sync_host" = mact ]; then
+        echo "building on mact"
+        rsync -az --delete \
+            --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' \
+            --exclude='*' -e 'ssh -o BatchMode=yes' ./ mact:projs/cs/
+        ssh -o BatchMode=yes mact 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/projs/cs && cargo build --locked --release && mkdir -p ~/.local/bin'
+        install_on mact projs/cs/target/release/cs
+        if [ "$sync_host" = mac ]; then
+            ssh -o BatchMode=yes mac 'mkdir -p ~/.local/bin ~/.cache/cs-src'
+            scp -3 -q -o BatchMode=yes mact:projs/cs/target/release/cs mac:.cache/cs-src/cs-sync-binary
+            install_on mac .cache/cs-src/cs-sync-binary
+        fi
+        exit 0
     fi
     remote=$(ssh -o BatchMode=yes "$sync_host" 'uname -sm')
     ssh -o BatchMode=yes "$sync_host" 'mkdir -p ~/.local/bin ~/.cache/cs-src'
@@ -36,15 +64,7 @@ sync host="mac": build
         ssh -o BatchMode=yes "$sync_host" 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/cs-src && cargo build --locked --release'
         sync_binary='.cache/cs-src/target/release/cs'
     fi
-    ssh -o BatchMode=yes "$sync_host" "bash -s -- $sync_binary" <<'SH'
-    set -euo pipefail
-    pending=$(mktemp "$HOME/.local/bin/.cs-sync.XXXXXX")
-    trap 'rm -f "$pending"' EXIT
-    install -m 755 "$HOME/$1" "$pending"
-    "$pending" --version
-    mv -f "$pending" "$HOME/.local/bin/cs"
-    echo "Installed $HOME/.local/bin/cs"
-    SH
+    install_on "$sync_host" "$sync_binary"
 
 # Run tests
 test:
