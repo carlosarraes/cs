@@ -199,8 +199,10 @@ fn run_utility(args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
     let source = crate::native::source_config()?;
     let profile = crate::native::prepare(alias, current, &source)?;
     crate::native::verify(&profile, alias, &current.email)?;
-    let mut command = crate::native::command(&profile, args)?;
+    // Claude requires global options before utility subcommands such as mcp list.
+    let mut command = crate::native::command(&profile, Vec::new())?;
     command
+        .args(args)
         .env_remove("CS_NATIVE_LEASE")
         .env_remove("CS_NATIVE_GENERATION");
     eprintln!(

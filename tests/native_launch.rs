@@ -45,6 +45,9 @@ if [ -n "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN$ANTHROP
 case " $* " in
  *" auth status "*) printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"a@x"}'; exit 0;;
 esac
+case " $* " in
+ *" mcp "*" --settings "*) echo "error: unknown option '--settings'" >&2; exit 2;;
+esac
 printf '%s\n' "$@" > "$TEST_ARGS"
 printf '%s\n' "$$" > "$TEST_CHILD_PID"
 if [ "$TEST_WAIT" = yes ]; then
@@ -709,7 +712,7 @@ fn utility_commands_use_pinned_identity_without_quota_or_conversation() {
             !args.contains("--session-id") && !args.contains("--resume"),
             "{args}"
         );
-        assert!(args.starts_with(command[0]));
+        assert!(args.lines().any(|arg| arg == command[0]));
         assert!(!f.data.join("cs/routing.json").exists());
         assert_eq!(
             fs::read(f.source.join(".credentials.json")).unwrap(),
