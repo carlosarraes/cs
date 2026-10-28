@@ -6,68 +6,120 @@ version := `grep -m1 '^version' Cargo.toml | cut -d'"' -f2`
 
 default: build
 
+# Carlos's Mac is an install-only host for this tool.
+[private]
+assert-build-host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(hostname -s)" in
+        Carloss-MacBook-Air|Carloss-MacBook-Air.*)
+            echo "error: do not compile cs on mac; run just sync mac mact" >&2
+            exit 1;;
+    esac
+    if [[ -e "$HOME/.config/cs/no-build" ]]; then
+        echo "error: compilation disabled on this host; run just sync mac mact" >&2
+        exit 1
+    fi
+
 # Build release binary and copy to ~/.local/bin
-build:
+build: assert-build-host
     cargo build --release
     mkdir -p {{install_dir}}
     cp target/release/{{binary_name}} {{install_dir}}/
     @echo "Installed {{binary_name}} -> {{install_dir}}/{{binary_name}}"
 
-# Build locally and install on an SSH host without a release (defaults to mac).
-# mac and mact get a binary built on mact; the Mac itself never compiles.
+# Build on a separate host, then atomically install on the destination.
 [positional-arguments]
-sync host="mac": build
+sync host="mac" builder="mact":
     #!/usr/bin/env bash
     set -euo pipefail
     sync_host="$1"
-    if [[ ! "$sync_host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
-        echo "error: use an SSH host alias, hostname, or user@host" >&2
+    build_host="$2"
+    for host in "$sync_host" "$build_host"; do
+        if [[ ! "$host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
+            echo "error: use an SSH host alias, hostname, or user@host" >&2
+            exit 1
+        fi
+    done
+    if [[ "$build_host" == mac ]]; then
+        echo "error: mac is an install-only host; use mact as the builder" >&2
         exit 1
     fi
-    install_on() {
-        ssh -o BatchMode=yes "$1" "bash -s -- $2" <<'SH'
+    ssh_options=(-o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+    builder_name=$(ssh "${ssh_options[@]}" "$build_host" 'hostname -s')
+    case "$builder_name" in
+        Carloss-MacBook-Air|Carloss-MacBook-Air.*)
+            echo "error: Carlos's Mac is an install-only host; use mact as the builder" >&2
+            exit 1;;
+    esac
+    builder_platform=$(ssh "${ssh_options[@]}" "$build_host" 'uname -sm')
+    destination_platform=$(ssh "${ssh_options[@]}" "$sync_host" 'uname -sm')
+    if [[ "$builder_platform" != "$destination_platform" ]]; then
+        echo "error: builder $build_host is $builder_platform, destination $sync_host is $destination_platform; choose a matching builder" >&2
+        exit 1
+    fi
+    stage=$(mktemp -d "${TMPDIR:-/tmp}/cs-sync.XXXXXX")
+    pending=""
+    builder_stage=""
+    cleanup() {
+        rm -rf "$stage"
+        if [[ -n "$builder_stage" ]]; then
+            ssh "${ssh_options[@]}" "$build_host" "rm -rf -- '$builder_stage'" || true
+        fi
+        if [[ -n "$pending" ]]; then
+            ssh "${ssh_options[@]}" "$sync_host" "rm -f -- '$pending'" || true
+        fi
+    }
+    trap cleanup EXIT
+    candidate=$(ssh "${ssh_options[@]}" "$build_host" 'test ! -e "$HOME/.config/cs/no-build" || { echo "error: compilation disabled on this host" >&2; exit 1; }; mkdir -p ~/.cache/cs-build; mktemp -d "$HOME/.cache/cs-build/source.XXXXXX"')
+    if [[ ! "$candidate" =~ ^/[a-zA-Z0-9_./-]+/\.cache/cs-build/source\.[a-zA-Z0-9]+$ ]]; then
+        echo "error: invalid builder staging path" >&2
+        exit 1
+    fi
+    builder_stage="$candidate"
+    echo "Building cs on $build_host ($builder_platform); installing on $sync_host"
+    rsync -az \
+        --include='/Cargo.toml' --include='/Cargo.lock' --include='/build.rs' \
+        --include='/rust-toolchain.toml' --include='/src/***' \
+        --exclude='*' -e 'ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2' ./ "$build_host:$builder_stage/"
+    ssh "${ssh_options[@]}" "$build_host" "bash -s -- '$builder_stage'" <<'BUILD'
     set -euo pipefail
-    pending=$(mktemp "$HOME/.local/bin/.cs-sync.XXXXXX")
+    test ! -e "$HOME/.config/cs/no-build" || { echo "error: compilation disabled on this host" >&2; exit 1; }
+    export PATH="$HOME/.cargo/bin:$PATH"
+    python3 - "$1" <<'PYBUILD'
+    import fcntl, os, pathlib, shutil, subprocess, sys
+    source = pathlib.Path(sys.argv[1])
+    cache = pathlib.Path.home() / ".cache/cs-build"
+    with (cache / "build.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        env = dict(os.environ, CARGO_TARGET_DIR=str(cache / "target"))
+        result = subprocess.run(["cargo", "build", "--locked", "--release"], cwd=source, env=env)
+        if result.returncode:
+            sys.exit(result.returncode)
+        shutil.copy2(cache / "target/release/cs", source / "cs")
+    PYBUILD
+    BUILD
+    scp -q "${ssh_options[@]}" "$build_host:$builder_stage/cs" "$stage/cs"
+    candidate=$(ssh "${ssh_options[@]}" "$sync_host" 'mkdir -p ~/.local/bin; mktemp "$HOME/.local/bin/.cs-sync.XXXXXX"')
+    if [[ ! "$candidate" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+        echo "error: invalid destination staging path" >&2
+        exit 1
+    fi
+    pending="$candidate"
+    scp -q "${ssh_options[@]}" "$stage/cs" "$sync_host:$pending"
+    ssh "${ssh_options[@]}" "$sync_host" "bash -s -- '$pending'" <<'SH'
+    set -euo pipefail
+    pending="$1"
     trap 'rm -f "$pending"' EXIT
-    install -m 755 "$HOME/$1" "$pending"
+    chmod 755 "$pending"
     "$pending" --version
     mv -f "$pending" "$HOME/.local/bin/cs"
     echo "Installed $HOME/.local/bin/cs"
     SH
-    }
-    # The Mac is under heavy load, so it never compiles: mact has the same
-    # Apple chip, builds in its ~/projs/cs clone, and the binary is copied over.
-    if [ "$sync_host" = mac ] || [ "$sync_host" = mact ]; then
-        echo "building on mact"
-        rsync -az --delete \
-            --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' \
-            --exclude='*' -e 'ssh -o BatchMode=yes' ./ mact:projs/cs/
-        ssh -o BatchMode=yes mact 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/projs/cs && cargo build --locked --release && mkdir -p ~/.local/bin'
-        install_on mact projs/cs/target/release/cs
-        if [ "$sync_host" = mac ]; then
-            ssh -o BatchMode=yes mac 'mkdir -p ~/.local/bin ~/.cache/cs-src'
-            scp -3 -q -o BatchMode=yes mact:projs/cs/target/release/cs mac:.cache/cs-src/cs-sync-binary
-            install_on mac .cache/cs-src/cs-sync-binary
-        fi
-        exit 0
-    fi
-    remote=$(ssh -o BatchMode=yes "$sync_host" 'uname -sm')
-    ssh -o BatchMode=yes "$sync_host" 'mkdir -p ~/.local/bin ~/.cache/cs-src'
-    if [ "$remote" = "$(uname -sm)" ]; then
-        scp -q target/release/{{binary_name}} "$sync_host":.cache/cs-src/cs-sync-binary
-        sync_binary='.cache/cs-src/cs-sync-binary'
-    else
-        echo "$sync_host is $remote; syncing source and building there"
-        rsync -az --delete \
-            --include='/Cargo.toml' --include='/Cargo.lock' --include='/src/***' \
-            --exclude='*' -e 'ssh -o BatchMode=yes' ./ "$sync_host":.cache/cs-src/
-        ssh -o BatchMode=yes "$sync_host" 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/cs-src && cargo build --locked --release'
-        sync_binary='.cache/cs-src/target/release/cs'
-    fi
-    install_on "$sync_host" "$sync_binary"
+    pending=""
 
 # Run tests
-test:
+test: assert-build-host
     cargo test
 
 # Format code
@@ -79,14 +131,14 @@ fmt-check:
     cargo fmt --check
 
 # Lint with warnings as errors
-lint:
+lint: assert-build-host
     cargo clippy --all-targets -- -D warnings
 
 # Format check + lint + tests
 check: fmt-check lint test
 
 # Build and run, e.g. `just run list`
-run *ARGS:
+run *ARGS: assert-build-host
     cargo run -- {{ARGS}}
 
 # Print the current version
@@ -95,7 +147,7 @@ version:
 
 # Cut a release: bump Cargo.toml, commit, tag vX.Y.Z, push (CI builds binaries).
 # Usage: just release 0.0.2
-release new_version:
+release new_version: assert-build-host
     #!/usr/bin/env bash
     set -euo pipefail
     ver="{{new_version}}"; ver="${ver#v}"

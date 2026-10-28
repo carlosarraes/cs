@@ -23,6 +23,28 @@ verifies the binary against the release `SHA256SUMS` before installing to
 
 From source: `cargo install --path .` or `just build`.
 
+## Build and sync hosts
+
+Never compile cs or cx on `mac`, Carlos's busy MacBook Air. For Darwin/ARM64,
+use `mact`. `just sync mac` defaults to `just sync mac mact`: it syncs the
+current source, including uncommitted changes, to `mact`, builds there, then
+copies and atomically installs the binary on `mac`. No Cargo command runs on
+`mac`, and sync no longer builds or installs on the calling machine.
+
+For another platform, use `just sync DESTINATION MATCHING_BUILD_HOST`.
+Builder and destination OS/architecture must match. A failed build or transfer
+leaves the installed binary untouched. Rust and Python 3 are needed only on the builder.
+The caller needs SSH, rsync and scp access to both hosts; neither remote needs
+SSH access to the other. Each sync uses a private source directory under `~/.cache/cs-build` on the builder;
+existing project checkouts and account credentials are not copied or overwritten.
+A lock protects the shared Cargo cache through compilation and artifact capture.
+Concurrent syncs keep separate sources/artifacts; temporary sources are removed.
+
+Local compilation recipes refuse Carlos's Mac by hostname or the persistent
+`~/.config/cs/no-build` marker. `just build` remains a local install command on
+permitted hosts. Sync does not bump versions, commit, push, tag or release. The sync regression
+tests require just and mock remote commands; they never contact real hosts.
+
 ## Usage
 
 Run `cs --llm` for the compact agent guide, including routing rules and
