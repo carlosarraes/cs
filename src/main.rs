@@ -40,16 +40,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate a new account and save it under an alias
+    /// Save an account under an alias, restoring the previously active login by default
+    #[command(
+        after_help = "By default, restore the previously selected login and preserve current/previous.
+--current also restores the selected login after capturing the already-live account.
+Use --switch to activate the saved account. If no other selected account can be
+restored, or --force replaces the active alias, the saved account stays active."
+    )]
     Add {
         /// Name to save the account as
         alias: String,
-        /// Snapshot the already-logged-in account instead of running a login
+        /// Snapshot the live login, then restore the selected account unless --switch is set
         #[arg(long)]
         current: bool,
         /// Overwrite the alias if it already exists
         #[arg(short, long)]
         force: bool,
+        /// Make the saved account active instead of restoring the previous login
+        #[arg(long)]
+        switch: bool,
     },
     /// Change the shared login, or move selected conversations to a destination account
     #[command(after_help = "Targeted: cs switch DEST --from SOURCE
@@ -167,7 +176,8 @@ fn main() -> Result<()> {
             alias,
             current,
             force,
-        } => commands::add(&alias, current, force),
+            switch,
+        } => commands::add(&alias, current, force, switch),
         Commands::Switch {
             alias,
             from,

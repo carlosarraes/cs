@@ -51,8 +51,9 @@ Run `cs --llm` for the compact agent guide, including routing rules and
 targeted-switch examples.
 
 ```sh
-cs add work              # run `claude auth login`, save the account as "work"
-cs add main --current    # save the already-logged-in account as "main"
+cs add work              # log in, save "work", restore the previously selected login
+cs add main --current    # save the live login, then restore the selected account
+cs add work --switch     # log in, save "work", and make it active
 cs switch work           # switch to "work"
 cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
@@ -68,7 +69,7 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 
 | Command | Description |
 |---|---|
-| `cs add <alias> [--current] [--force]` | Authenticate (or snapshot `--current`) and save under `<alias>` |
+| `cs add <alias> [--current] [--force] [--switch]` | Save an account; restore the selected login unless `--switch` is set |
 | `cs switch <alias>` / `cs switch -` | Activate an alias; `-` is the previous one |
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
@@ -83,6 +84,14 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 | `cs logs [-f]` | Print / follow the session router log |
 | `cs daemon install` | Install a systemd user unit / launchd agent that runs `cs start` at login |
 | `cs --version` | Print version |
+
+`cs add` saves the new account and restores the previously selected login,
+keeping `current` and `previous` unchanged. `--current` captures the live login
+without starting authentication, then also restores the selected account.
+Use `--switch` to activate the saved account immediately; it works with
+`--current` and `--force`. If no selected account can be restored, the new
+account stays live and becomes current, and cs explains why. Overwriting the
+currently selected alias with `--force` also keeps that alias active.
 
 If Claude Code is running when you switch, `cs` warns you first (pass `--yes`
 to skip the prompt).

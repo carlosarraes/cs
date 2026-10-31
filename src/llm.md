@@ -60,8 +60,9 @@ Other sessions and the shared login are unaffected by targeted moves.
 
 ## Shared login and account maintenance
 
-cs add work             # Authenticate and save an account
-cs add work --current   # Save the already logged-in account
+cs add work             # Save an account; restore the selected login
+cs add work --current   # Snapshot the live login, then restore the selected account
+cs add work --switch    # Save an account and make it active
 cs refresh              # Update saved account after an external /login
 cs switch work          # Change shared login; may disrupt unmanaged Claude
 cs switch -             # Return to previous shared login

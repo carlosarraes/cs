@@ -98,7 +98,7 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
     ps.current = Some(target.to_string());
 }
 
-pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
+pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> {
     let _credentials = crate::accounts::credential_lock()?;
     validate_alias(alias)?;
     let _lock = state::lock()?;
@@ -111,35 +111,77 @@ pub fn add(alias: &str, current: bool, force: bool) -> Result<()> {
     }
 
     if !current {
-        // Keep the outgoing account's snapshot fresh before login overwrites
-        // the live credentials.
+        // Login overwrites the shared credentials. Persist rotated outgoing
+        // credentials even if login is cancelled or capture later fails.
         if let Some(cur) = state.claude().current.clone() {
             refresh_snapshot(state.claude_mut(), &cur);
         }
-        println!("Launching claude login for '{alias}'…");
-        claude::login()?;
+        state.save()?;
     }
-
-    let (email, data) = claude::capture().context(if current {
-        "no active account to snapshot (log in first, or drop --current)"
+    let original_account = state
+        .claude()
+        .current
+        .as_ref()
+        .and_then(|cur| state.claude().accounts.get(cur))
+        .cloned();
+    let captured = if current {
+        claude::capture().context("no active account to snapshot (log in first, or drop --current)")
     } else {
-        "could not read the account after login"
-    })?;
-
-    let ps = state.claude_mut();
-    if ps.current.as_deref() != Some(alias) {
-        ps.previous = ps.current.take();
-    }
-    ps.current = Some(alias.to_string());
-    ps.accounts.insert(
+        println!("Launching claude login for '{alias}'…");
+        claude::login()
+            .and_then(|()| claude::capture().context("could not read the account after login"))
+    };
+    let (email, data) = match captured {
+        Ok(captured) => captured,
+        Err(error) => {
+            if !current {
+                if let Some(account) = &original_account {
+                    if claude::restore(&account.data).is_err() {
+                        return Err(error.context(
+                            "the previous login could not be restored after login failed",
+                        ));
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
+    let previous_account =
+        original_account.filter(|_| state.claude().current.as_deref() != Some(alias));
+    state.claude_mut().accounts.insert(
         alias.to_string(),
         Account {
             email: email.clone(),
-            data,
+            data: data.clone(),
         },
     );
+    let reason = if switch {
+        None
+    } else if let Some(account) = previous_account {
+        if claude::restore(&account.data).is_ok() {
+            state.save()?;
+            println!("Saved account '{alias}' ({email}); not active. Run `cs switch {alias}` to use it (or add with --switch).");
+            return Ok(());
+        }
+        // A restore can fail after writing one half of the login. Reapply both
+        // halves before claiming that the newly captured account is live.
+        claude::restore(&data)
+            .context("could not restore either live account; saved selection unchanged")?;
+        Some("the previous active account could not be restored")
+    } else if state.claude().current.as_deref() == Some(alias) {
+        Some("this alias was already active")
+    } else {
+        Some("there was no other restorable active account")
+    };
+    let ps = state.claude_mut();
+    if ps.current.as_deref() != Some(alias) {
+        record_switch(ps, alias);
+    }
     state.save()?;
-    println!("Saved account '{alias}' ({email}) and set it active.");
+    match reason {
+        Some(reason) => println!("Saved account '{alias}' ({email}) and set it active ({reason})."),
+        None => println!("Saved account '{alias}' ({email}) and set it active."),
+    }
     Ok(())
 }
 
