@@ -35,7 +35,11 @@ sys.exit(0 if line == ('w' * 600 if mode == 'long' else 'wxyz') else 72)
     (root / 'config' / '.credentials.json').write_text('{"claudeAiOauth":{}}')
     (root / 'config' / '.claude.json').write_text('{"oauthAccount":{"emailAddress":"fake@example.test"}}')
     for mode, keys in [('paste', b'wxyz\r'), ('long', b'w' * 600 + b'\r'), ('backspace', b'wxyQ\x7fz\r'),
-                       ('backspace', b'wxyQ\x08z\r'), ('cancel', b'\x03'),
+                       ('backspace', b'wxyQ\x08z\r'),
+                       ('escapes', b'\x1b[200~wxyz\x1b[201~\x1b[A\r'),
+                       ('split-escapes', [b'\x1b', b'[20', b'0~', b'wxyz', b'\x1b[', b'201~', b'\x1b', b'[A', b'\x1bO', b'A', b'\x1b', b'\r']),
+                       ('lone-escape', b'\x1bwxyz\r'), ('escape-cancel', b'\x1b[\x03'),
+                       ('cancel', b'\x03'),
                        ('signal', None), ('sigint', None), ('sighup', None), ('sigquit', None),
                        ('eof', b'\x04'), ('browser', None), ('failure', None), ('spawn-failure', None)]:
         master, slave = pty.openpty()
@@ -60,6 +64,10 @@ sys.exit(0 if line == ('w' * 600 if mode == 'long' else 'wxyz') else 72)
                     sent = True
                     if mode in ('signal', 'sigint', 'sighup', 'sigquit'):
                         process.send_signal({'signal':signal.SIGTERM, 'sigint':signal.SIGINT, 'sighup':signal.SIGHUP, 'sigquit':signal.SIGQUIT}[mode])
+                    elif isinstance(keys, list):
+                        for chunk in keys:
+                            os.write(master, chunk)
+                            time.sleep(.03)
                     elif keys is not None: os.write(master, keys)
                 if process.poll() is not None:
                     while select.select([master], [], [], 0)[0]:
@@ -68,12 +76,12 @@ sys.exit(0 if line == ('w' * 600 if mode == 'long' else 'wxyz') else 72)
             assert process.poll() is not None, 'login timed out'
             assert termios.tcgetattr(slave) == before, 'terminal was not restored'
             assert b'wxyz' not in transcript and b'wxyQ' not in transcript, 'input leaked'
-            if mode in ('paste', 'long', 'backspace'):
+            if mode in ('paste', 'long', 'backspace', 'escapes', 'split-escapes', 'lone-escape'):
                 assert process.returncode == 0, 'fake child did not receive expected input'
                 if mode == 'long':
                     assert transcript.count(b'*') == 600, 'long paste was truncated'
                     assert b'wwww' not in transcript, 'long input leaked'
-                elif mode == 'paste': assert transcript.count(b'*') == 4, 'incorrect mask count'
+                elif mode in ('paste', 'escapes', 'split-escapes', 'lone-escape'): assert transcript.count(b'*') == 4, 'incorrect mask count'
                 else:
                     assert b'****\x08 \x08*' in transcript, 'backspace feedback missing'
                     assert transcript.count(b'*') == 5, 'incorrect edited mask count'

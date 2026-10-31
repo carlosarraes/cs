@@ -100,6 +100,32 @@ fn resize(master: i32) {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum EscapeState {
+    #[default]
+    None,
+    Escape,
+    Csi,
+    Ss3,
+}
+
+impl EscapeState {
+    fn consume(&mut self, byte: u8) -> bool {
+        match (*self, byte) {
+            (_, 0x1b) => *self = Self::Escape,
+            (Self::Escape, b'[') => *self = Self::Csi,
+            (Self::Escape, b'O') => *self = Self::Ss3,
+            (Self::Csi, 0x40..=0x7e) | (Self::Ss3, _) => *self = Self::None,
+            (Self::Csi, _) => {}
+            _ => {
+                *self = Self::None;
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub fn run() -> Result<()> {
     let mut command = Command::new("claude");
     command.args(["auth", "login"]);
@@ -171,6 +197,7 @@ fn interactive(command: &mut Command) -> Result<ExitStatus> {
         .stderr(Stdio::null());
     let mut output = io::stdout().lock();
     let mut line = Vec::new();
+    let mut escape = EscapeState::default();
     loop {
         if INTERRUPTED.load(Ordering::Relaxed) != 0 {
             return Err(anyhow!("login interrupted"));
@@ -228,6 +255,9 @@ fn interactive(command: &mut Command) -> Result<ExitStatus> {
                 return Err(anyhow!("login input closed"));
             }
             for &byte in &bytes[..n] {
+                if byte != 3 && escape.consume(byte) {
+                    continue;
+                }
                 match byte {
                     3 => return Err(anyhow!("login cancelled")),
                     4 if line.is_empty() => master.write_all(&[4])?,
