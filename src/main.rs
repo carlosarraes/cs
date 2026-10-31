@@ -5,6 +5,7 @@ mod config;
 mod conversation;
 mod daemon;
 mod launch;
+mod login;
 mod native;
 mod policy;
 mod proxy;
@@ -45,7 +46,8 @@ enum Commands {
         after_help = "By default, restore the previously selected login and preserve current/previous.
 --current also restores the selected login after capturing the already-live account.
 Use --switch to activate the saved account. If no other selected account can be
-restored, or --force replaces the active alias, the saved account stays active."
+restored, or --force replaces the active alias, the saved account stays active.
+Interactive login masks input with *; press Enter after pasting."
     )]
     Add {
         /// Name to save the account as

@@ -93,6 +93,12 @@ Use `--switch` to activate the saved account immediately; it works with
 account stays live and becomes current, and cs explains why. Overwriting the
 currently selected alias with `--force` also keeps that alias active.
 
+Interactive login shows `*` for each typed or pasted character; Backspace
+removes one and Enter submits the edited line. Input is masked throughout
+login, including before the code prompt. Browser callback login still works
+without pasting. With redirected input or output, cs leaves Claude's stdio
+intact and prints a reminder to press Enter after pasting an invisible code.
+
 If Claude Code is running when you switch, `cs` warns you first (pass `--yes`
 to skip the prompt).
 

@@ -13,7 +13,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Command;
 
 use crate::util::{home, patch_json, read_json_key};
 
@@ -182,14 +181,7 @@ fn apply_token_response(oauth: &Value, resp: &Value, now_ms: i64) -> Result<Valu
 
 /// Drive Claude Code's interactive login.
 pub fn login() -> Result<()> {
-    let status = Command::new("claude")
-        .args(["auth", "login"])
-        .status()
-        .context("failed to run `claude` (is Claude Code installed and on PATH?)")?;
-    if !status.success() {
-        return Err(anyhow!("`claude auth login` did not complete"));
-    }
-    Ok(())
+    crate::login::run()
 }
 
 pub fn read_profile_oauth(path: &std::path::Path) -> Result<Option<Value>> {
