@@ -94,6 +94,9 @@ it cannot write one account's tokens into another account's alias, and it fixes
 `current` if the live login drifted. The router reconciles newer live credentials while it runs. `cs` also refuses to overwrite an alias whose saved account differs from
 the live login, so a mistaken login can never repoint an alias at someone else.
 
+Accounts without a five-hour limit, including Claude Max Ultra, show `5h —`.
+They remain subject to their reported weekly quota.
+
 Usage windows are colored in interactive terminals: green below 70%, yellow
 from 70% to below 90%, red from 90%, and bold red at 100% or above. Each window's
 percentage and reset countdown share its color. Piped output stays plain;

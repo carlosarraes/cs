@@ -245,7 +245,7 @@ impl Store {
                 bail!("{alias}: token expired or unavailable; run cs refresh after signing in; no automatic failover");
             }
             let exhausted = entries.get(&alias).and_then(|entry| entry.reading.known())
-                .is_some_and(|usage| usage.five_hour.utilization >= 100.0
+                .is_some_and(|usage| usage.five_hour.as_ref().is_some_and(|w| w.utilization >= 100.0)
                     || usage.seven_day.as_ref().is_some_and(|window| window.utilization >= 100.0));
             if exhausted {
                 bail!("{alias}: quota exhausted; no automatic failover (see cs usage)");
@@ -274,7 +274,10 @@ impl Store {
 }
 fn quota_exhausted(entry: Option<&Entry>) -> bool {
     entry.and_then(|e| e.reading.known()).is_some_and(|usage| {
-        usage.five_hour.utilization >= 100.
+        usage
+            .five_hour
+            .as_ref()
+            .is_some_and(|w| w.utilization >= 100.)
             || usage
                 .seven_day
                 .as_ref()
@@ -323,10 +326,10 @@ mod tests {
                     a.into(),
                     Entry::new(
                         Reading::Known(Usage {
-                            five_hour: Window {
+                            five_hour: Some(Window {
                                 utilization: 0.,
                                 resets_at: None,
-                            },
+                            }),
                             seven_day: None,
                         }),
                         now(),
@@ -447,7 +450,7 @@ mod tests {
                     resets_at: None,
                 });
             } else {
-                value.five_hour.utilization = 100.;
+                value.five_hour.as_mut().unwrap().utilization = 100.;
             }
             let resumed = store.register().unwrap();
             assert!(store

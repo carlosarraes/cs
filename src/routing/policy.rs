@@ -17,7 +17,10 @@ pub fn select<'a>(
                 return None;
             }
             let usage = entry.reading.known()?;
-            let five = rate(&usage.five_hour, now, five_ceiling, 5 * 3600)?;
+            let five = match &usage.five_hour {
+                Some(w) => rate(w, now, five_ceiling, 5 * 3600)?,
+                None => f64::INFINITY,
+            };
             let week = match &usage.seven_day {
                 Some(w) => rate(w, now, weekly_ceiling, 7 * 24 * 3600)?,
                 None => 0.,
@@ -54,10 +57,10 @@ mod tests {
     fn entry(five: f64, week: f64, reset: i64) -> Entry {
         Entry::new(
             Reading::Known(Usage {
-                five_hour: Window {
+                five_hour: Some(Window {
                     utilization: five,
                     resets_at: None,
-                },
+                }),
                 seven_day: Some(Window {
                     utilization: week,
                     resets_at: Some(
@@ -70,6 +73,40 @@ mod tests {
             1000,
         )
     }
+    #[test]
+    fn unlimited_five_hour_still_checks_weekly_quota_and_freshness() {
+        let mut ultra = entry(100., 10., 2000);
+        if let Reading::Known(usage) = &mut ultra.reading {
+            usage.five_hour = None;
+        }
+        let entries = BTreeMap::from([
+            ("ultra".into(), ultra.clone()),
+            ("limited".into(), entry(0., 10., 2000)),
+        ]);
+        assert_eq!(
+            select(&entries, &BTreeMap::new(), 1000, 90., 95., 300),
+            Some("ultra")
+        );
+        assert_eq!(
+            select(&entries, &BTreeMap::new(), 1301, 90., 95., 300),
+            None
+        );
+        if let Reading::Known(usage) = &mut ultra.reading {
+            usage.seven_day.as_mut().unwrap().utilization = 100.;
+        }
+        assert_eq!(
+            select(
+                &BTreeMap::from([("ultra".into(), ultra)]),
+                &BTreeMap::new(),
+                1000,
+                90.,
+                95.,
+                300
+            ),
+            None
+        );
+    }
+
     #[test]
     fn counts_first_then_capacity_until_reset() {
         let entries = BTreeMap::from([

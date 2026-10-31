@@ -33,7 +33,8 @@ pub struct Window {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
-    pub five_hour: Window,
+    #[serde(default)]
+    pub five_hour: Option<Window>,
     #[serde(default)]
     pub seven_day: Option<Window>,
 }
@@ -290,7 +291,11 @@ pub fn format_lines_with_counts(
             };
             let mut parts = match &e.reading {
                 Reading::Known(u) => {
-                    let mut p = vec![window("5h", &u.five_hour)];
+                    let mut p = vec![u
+                        .five_hour
+                        .as_ref()
+                        .map(|w| window("5h", w))
+                        .unwrap_or_else(|| "5h —".into())];
                     if let Some(w) = &u.seven_day {
                         p.push(window("7d", w));
                     }
@@ -303,7 +308,13 @@ pub fn format_lines_with_counts(
                     };
                     let mut p = Vec::new();
                     if let Some((u, t)) = &e.last_known {
-                        p.push(dim(format!("5h {:.0}%", u.five_hour.utilization), color));
+                        p.push(dim(
+                            u.five_hour
+                                .as_ref()
+                                .map(|w| format!("5h {:.0}%", w.utilization))
+                                .unwrap_or_else(|| "5h —".into()),
+                            color,
+                        ));
                         if let Some(w) = &u.seven_day {
                             p.push(dim(format!("7d {:.0}%", w.utilization), color));
                         }
@@ -433,20 +444,25 @@ pub fn fetch(access_token: &str) -> std::result::Result<Usage, FetchError> {
 
 pub fn parse_usage(body: &str) -> Result<Usage> {
     let v: Value = serde_json::from_str(body).context("parsing usage response")?;
-    let window = |key: &str| -> Option<Window> {
-        let w = v.get(key)?;
-        Some(Window {
-            utilization: w.get("utilization")?.as_f64()?,
-            resets_at: w.get("resets_at").and_then(Value::as_str).map(String::from),
-        })
-    };
-    let seven_day = window("seven_day");
-    if v.get("seven_day").is_some_and(|w| !w.is_null()) && seven_day.is_none() {
-        return Err(anyhow!("usage response has an invalid seven_day window"));
+    if !v.is_object() {
+        return Err(anyhow!("usage response is not an object"));
     }
+    let window = |key: &str| -> Result<Option<Window>> {
+        let Some(w) = v.get(key).filter(|w| !w.is_null()) else {
+            return Ok(None);
+        };
+        let utilization = w
+            .get("utilization")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow!("usage response has an invalid {key} window"))?;
+        Ok(Some(Window {
+            utilization,
+            resets_at: w.get("resets_at").and_then(Value::as_str).map(String::from),
+        }))
+    };
     Ok(Usage {
-        five_hour: window("five_hour").ok_or_else(|| anyhow!("usage response has no five_hour"))?,
-        seven_day,
+        five_hour: window("five_hour")?,
+        seven_day: window("seven_day")?,
     })
 }
 
@@ -525,6 +541,79 @@ mod tests {
         "extra_usage": {"is_enabled": false}
     }"#;
 
+    // Quota-related fields from the Ultra response on mac; reset time redacted.
+    const ULTRA_FIXTURE: &str = r#"{
+        "five_hour": null,
+        "seven_day": {"utilization": 100.0, "resets_at": "2026-11-01T12:00:00Z",
+                      "limit_dollars": null, "used_dollars": null,
+                      "remaining_dollars": null, "locked_reason": null},
+        "seven_day_oauth_apps": null, "seven_day_opus": null,
+        "seven_day_sonnet": null, "seven_day_cowork": null, "seven_day_omelette": null,
+        "extra_usage": {"is_enabled": false, "monthly_limit": null,
+                        "used_credits": null, "utilization": null},
+        "limits": [{"kind": "redacted", "group": "redacted", "percent": 100,
+                    "severity": "redacted", "resets_at": "2026-11-01T12:00:00Z",
+                    "scope": null, "is_active": true}],
+        "seven_day_breakdown": {"as_of": "redacted", "window_started_at": "redacted",
+                                "rows": [{"key": "redacted", "display_name": "redacted", "percent": 0}]},
+        "weekly_scoped_shares": [{"limit_index": 1, "used_percent_of_weekly": 0,
+                                  "allowance_percent_of_weekly": 0}]
+    }"#;
+
+    #[test]
+    fn parses_real_ultra_response_shape() {
+        let usage = parse_usage(ULTRA_FIXTURE).unwrap();
+        assert!(usage.five_hour.is_none());
+        let weekly = usage.seven_day.unwrap();
+        assert_eq!(weekly.utilization, 100.0);
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-11-01T12:00:00Z"));
+    }
+
+    #[test]
+    fn absent_or_null_five_hour_is_unlimited() {
+        for body in [r#"{"seven_day": null}"#, r#"{"five_hour": null}"#] {
+            let usage = parse_usage(body).expect("missing window is valid");
+            let encoded = serde_json::to_value(usage).unwrap();
+            assert!(encoded["five_hour"].is_null());
+        }
+    }
+
+    #[test]
+    fn non_object_usage_response_is_not_unlimited_capacity() {
+        for body in ["null", "[]", "42", r#""invalid""#] {
+            assert!(parse_usage(body).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_five_hour_is_not_unlimited() {
+        for value in [json!({}), json!("bad"), json!({"utilization":"bad"})] {
+            assert!(parse_usage(&json!({"five_hour":value}).to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn unlimited_five_hour_renders_without_warning() {
+        let mut obs = Observation::default();
+        obs.accounts.insert(
+            "ultra".into(),
+            Entry::new(Reading::Known(parse_usage(ULTRA_FIXTURE).unwrap()), 1000),
+        );
+        let line = &format_lines(&obs, 1000)[0];
+        assert!(line.contains("5h — · 7d 100%"));
+        assert!(!line.contains("??"));
+        assert!(!line.contains("as of"));
+    }
+
+    #[test]
+    fn legacy_usage_cache_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.json");
+        fs::write(&path, r#"{"observed_at":1000,"accounts":{"old":{"reading":{"status":"known","five_hour":{"utilization":12,"resets_at":null}},"fetched_at":1000}}}"#).unwrap();
+        let obs = Observation::load_from(&path).unwrap().unwrap();
+        assert!(format_lines(&obs, 1000)[0].contains("5h 12%"));
+    }
+
     #[test]
     fn drifted_live_login_cannot_supply_another_alias_usage() {
         let account = crate::state::Account {
@@ -565,10 +654,10 @@ mod tests {
                 alias.into(),
                 Entry::new(
                     Reading::Known(Usage {
-                        five_hour: Window {
+                        five_hour: Some(Window {
                             utilization: 0.,
                             resets_at: None,
-                        },
+                        }),
                         seven_day: None,
                     }),
                     1000,
@@ -585,8 +674,8 @@ mod tests {
         let mut obs = Observation::default();
         for (alias, percent) in [("a", 69.0), ("b", 70.0), ("c", 90.0), ("d", 100.0)] {
             let mut usage = parse_usage(FIXTURE).unwrap();
-            usage.five_hour.utilization = percent;
-            usage.five_hour.resets_at = Some("1970-01-01T01:00:00Z".into());
+            usage.five_hour.as_mut().unwrap().utilization = percent;
+            usage.five_hour.as_mut().unwrap().resets_at = Some("1970-01-01T01:00:00Z".into());
             usage.seven_day = Some(Window {
                 utilization: 100.0,
                 resets_at: Some("1970-01-04T11:00:00Z".into()),
@@ -616,17 +705,20 @@ mod tests {
     #[test]
     fn parses_real_response_shape() {
         let u = parse_usage(FIXTURE).unwrap();
-        assert_eq!(u.five_hour.utilization, 5.0);
+        assert_eq!(u.five_hour.as_ref().unwrap().utilization, 5.0);
         assert_eq!(
-            u.five_hour.resets_at.as_deref(),
+            u.five_hour.as_ref().unwrap().resets_at.as_deref(),
             Some("2026-08-23T19:50:00.188677+00:00")
         );
         assert_eq!(u.seven_day.unwrap().utilization, 0.0);
     }
 
     #[test]
-    fn missing_five_hour_errors_but_seven_day_is_optional() {
-        assert!(parse_usage(r#"{"seven_day": null}"#).is_err());
+    fn both_windows_are_optional() {
+        assert!(parse_usage(r#"{"seven_day": null}"#)
+            .unwrap()
+            .five_hour
+            .is_none());
         let u = parse_usage(r#"{"five_hour": {"utilization": 1, "resets_at": "x"}}"#).unwrap();
         assert!(u.seven_day.is_none());
     }
@@ -640,7 +732,7 @@ mod tests {
                 "seven_day": {"utilization": 58.0, "resets_at": "2026-08-27T19:00:00.275071+00:00"}}"#,
         )
         .unwrap();
-        assert_eq!(u.five_hour.resets_at, None);
+        assert_eq!(u.five_hour.as_ref().unwrap().resets_at, None);
         assert_eq!(u.seven_day.unwrap().utilization, 58.0);
         let mut obs = Observation {
             current: Some("a".into()),

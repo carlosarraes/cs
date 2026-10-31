@@ -635,7 +635,7 @@ fn validate_pin(
         bail!("{alias}: token expired or unavailable; sign in and refresh this saved account; no fallback");
     }
     for (label, window) in [
-        ("five-hour", Some(&usage.five_hour)),
+        ("five-hour", usage.five_hour.as_ref()),
         ("weekly", usage.seven_day.as_ref()),
     ] {
         if let Some(window) = window {
@@ -656,7 +656,7 @@ fn fresh_pinned_usage(entry: &crate::usage::Entry, time: i64) -> Option<crate::u
         return None;
     }
     let usage = entry.reading.known()?;
-    for window in std::iter::once(&usage.five_hour).chain(usage.seven_day.iter()) {
+    for window in usage.five_hour.iter().chain(usage.seven_day.iter()) {
         if let Some(reset) = &window.resets_at {
             if crate::usage::parse_rfc3339(reset)? <= time {
                 return None;
@@ -712,10 +712,10 @@ mod tests {
     fn pinned_cache_requires_recent_successful_reading_before_reset() {
         let mut entry = crate::usage::Entry::new(
             crate::usage::Reading::Known(Usage {
-                five_hour: Window {
+                five_hour: Some(Window {
                     utilization: 10.,
                     resets_at: None,
-                },
+                }),
                 seven_day: None,
             }),
             1000,
@@ -724,13 +724,30 @@ mod tests {
         assert!(fresh_pinned_usage(&entry, 1300).is_none());
         assert!(fresh_pinned_usage(&entry, 999).is_none());
         if let crate::usage::Reading::Known(usage) = &mut entry.reading {
-            usage.five_hour.resets_at = Some("1970-01-01T00:18:20Z".into());
+            usage.five_hour.as_mut().unwrap().resets_at = Some("1970-01-01T00:18:20Z".into());
         }
         assert!(fresh_pinned_usage(&entry, 1100).is_none());
         entry.reading = crate::usage::Reading::Unknown {
             reason: "token rejected".into(),
         };
         assert!(fresh_pinned_usage(&entry, 1001).is_none());
+    }
+
+    #[test]
+    fn unlimited_five_hour_pin_uses_fresh_weekly_quota() {
+        let account = accounts().claude().accounts["work"].clone();
+        let mut usage = Usage {
+            five_hour: None,
+            seven_day: Some(Window {
+                utilization: 10.,
+                resets_at: None,
+            }),
+        };
+        assert!(validate_pin("work", &account, &usage, 1000).is_ok());
+        let entry = crate::usage::Entry::new(crate::usage::Reading::Known(usage.clone()), 1000);
+        assert!(fresh_pinned_usage(&entry, 1001).is_some());
+        usage.seven_day.as_mut().unwrap().utilization = 100.;
+        assert!(validate_pin("work", &account, &usage, 1000).is_err());
     }
 
     #[test]
@@ -758,10 +775,10 @@ mod tests {
     fn pin_rejects_unusable_tokens_and_exhausted_quota_without_secrets() {
         let mut account = accounts().claude().accounts["work"].clone();
         let mut usage = Usage {
-            five_hour: Window {
+            five_hour: Some(Window {
                 utilization: 0.,
                 resets_at: None,
-            },
+            }),
             seven_day: Some(Window {
                 utilization: 98.,
                 resets_at: None,
@@ -774,7 +791,7 @@ mod tests {
             .to_string()
             .contains("work: weekly quota exhausted"));
         usage.seven_day = None;
-        usage.five_hour.utilization = 100.;
+        usage.five_hour.as_mut().unwrap().utilization = 100.;
         assert!(validate_pin("work", &account, &usage, 1000).is_err());
         account.data["claudeAiOauth"]["expiresAt"] = 0.into();
         let error = validate_pin("work", &account, &usage, 1000)

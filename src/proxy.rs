@@ -304,10 +304,10 @@ mod tests {
                 "a".into(),
                 Entry::new(
                     Reading::Known(Usage {
-                        five_hour: Window {
+                        five_hour: Some(Window {
                             utilization: 0.,
                             resets_at: None,
-                        },
+                        }),
                         seven_day: None,
                     }),
                     usage::now(),
