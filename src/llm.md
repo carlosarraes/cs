@@ -6,7 +6,7 @@ No server is required for cs run. This guide is static and makes no API calls.
 ## Inspect
 
 cs list                 # Saved aliases and emails
-cs usage                # Cached 5h/7d usage and active session counts
+cs usage                # Subscription quotas and API-key 7d/30d spend
 cs usage --live          # Refresh usage now
 cs sessions             # Live conversation UUIDs, accounts, queued moves/errors
 cs whoami               # Shared login identity, not every managed session
@@ -29,6 +29,37 @@ including on resume. Existing processes do not switch accounts automatically.
 unusable credentials, unavailable usage, or exhausted quota fail with nonzero exit.
 An explicit pin never silently falls back. Pinned sessions count in cs usage.
 The selected Claude account does not set GitHub/git or other external identities.
+
+## Anthropic API keys
+
+cs add-key work-api          # Read API key from masked stdin, never argv
+cs add-key org-api --admin   # Also prompt for its organization admin key
+cs run --account work-api -- -p "say hi"
+cs del work-api              # Remove both API and admin secrets
+
+`cs list` marks key aliases [key]; only sk-ant-… plus the last four characters is
+shown. Secrets use macOS Keychain or Linux mode-0600 credential storage, never
+state/config. Key accounts require explicit --account and are excluded from
+automatic routing, switch next, shared-login switching, and the proxy. Utilities
+also accept key aliases. Running key conversations cannot change accounts.
+
+With an admin key, `cs usage` labels spend `admin usage_report`: paginated daily
+per-model token usage, filtered to the resolved API key id. Admin keys grant
+organization-wide access; cs uses them only for read-only GET metadata/usage
+requests. Use the same organization as the API key. Ambiguous hints fail safely.
+
+Without admin, `est.` counts only JSONL session ids cs launched with that key.
+Claude Code logs do not record which API key was used. Sessions started outside
+cs are not counted. Do not resume an unattributed conversation with a key or
+change its credentials outside cs. Deleting an alias drops its attribution/cache.
+Token-price totals cover midnight UTC 7/30 days ago through now, not invoices or
+discounts/tools/premium charges. As-of time is local. Unknown models use fallback
+rates with one warning. Offline static prices work without a network request.
+
+[spend] poll_secs defaults to 3600; live_pricing=false optionally enables LiteLLM
+pricing when true, cached 24h with a 3s timeout and offline fallback. `cs usage`
+refreshes stale spend; --live forces refresh, respecting 429 backoff. Old state,
+config, and quota observations remain compatible.
 
 ## Move running conversations
 
