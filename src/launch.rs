@@ -626,15 +626,16 @@ pub fn switch_targeted(
             .context("--session requires a conversation UUID from cs sessions")?;
     }
     let (destination_alias, _) = resolve_account(&accounts, destination)?;
-    let selected = Store::default_path()?.update(|s| {
+    let mut selected = Store::default_path()?.update(|s| {
         Ok(s.leases
             .iter()
             .filter_map(|(token, lease)| {
                 let root = lease.root.as_ref()?;
                 let binding = s.bindings.get(root)?;
-                let matches = source
-                    .as_deref()
-                    .is_some_and(|alias| alias == binding.alias)
+                let matches = (source.is_none() && session.is_none())
+                    || source
+                        .as_deref()
+                        .is_some_and(|alias| alias == binding.alias)
                     || session.is_some_and(|id| id == root);
                 (matches && binding.alias != destination_alias).then(|| {
                     (
@@ -647,7 +648,25 @@ pub fn switch_targeted(
             })
             .collect::<Vec<_>>())
     })?;
+    if source.is_none() && session.is_none() {
+        let controls = Controls::default_path()?.update(|sessions| Ok(sessions.clone()))?;
+        selected.retain(|(token, root, _, _)| {
+            let reason = match controls.get(token) {
+                Some(control) => control.unsupported.as_deref(),
+                None => Some("launcher does not support targeted switching; reopen it with the updated cs run"),
+            };
+            if let Some(reason) = reason {
+                eprintln!("Skipped {root}: {reason}");
+                false
+            } else {
+                true
+            }
+        });
+    }
     if selected.is_empty() {
+        if source.is_none() && session.is_none() {
+            return Ok(());
+        }
         bail!("no matching live conversations need moving to {destination_alias}; use cs sessions to see current assignments");
     }
     let (alias, account) = checked_destination(destination)?;

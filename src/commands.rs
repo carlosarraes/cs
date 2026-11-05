@@ -257,7 +257,11 @@ pub fn switch(requested: &str, yes: bool) -> Result<()> {
 
     let email = perform_switch(&mut state, &target)?;
     println!("Switched to '{target}' ({email}).");
-    Ok(())
+    drop(_lock);
+    drop(_credentials);
+    crate::launch::switch_targeted(&target, None, None, false).context(
+        "shared login switched, but managed conversations were not queued; check cs sessions",
+    )
 }
 
 /// The least-used (5h) other account, per the configured ceiling.

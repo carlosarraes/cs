@@ -789,3 +789,160 @@ fn utility_commands_refuse_expired_credentials_without_fallback() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("expired-secret"));
     assert!(!f.temp.path().join("child.pid").exists());
 }
+
+#[test]
+fn plain_switch_moves_all_managed_aliases_and_updates_shared_selection() {
+    let f = interactive_fixture();
+    let _one = start_interactive(&f, "a", false);
+    let _two = start_interactive(&f, "c", false);
+    let _already = start_interactive(&f, "b", false);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().len() == 3
+            && controls(&f)
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|s| s["busy"] == false)
+    });
+    let before = controls(&f);
+    let already = before
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|s| s["alias"] == "b")
+        .unwrap()["child"]
+        .clone();
+    let output = f.command().args(["switch", "b", "--yes"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .matches("Queued")
+            .count(),
+        2
+    );
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|s| s["alias"] == "b" && s["switching"] == false)
+    });
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "b");
+    assert_eq!(state["providers"]["claude"]["previous"], "a");
+    let shared: Value =
+        serde_json::from_slice(&fs::read(f.source.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(shared["oauthAccount"]["emailAddress"], "b@x");
+    for (token, old) in before.as_object().unwrap() {
+        let after = controls(&f);
+        assert_eq!(after[token]["root"], old["root"]);
+        if old["alias"] == "b" {
+            assert_eq!(after[token]["child"], already);
+        }
+    }
+}
+
+#[test]
+fn only_moves_source_alias_and_leaves_shared_login_unchanged() {
+    let f = interactive_fixture();
+    let _one = start_interactive(&f, "a", true);
+    let _two = start_interactive(&f, "c", false);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().len() == 2
+            && controls(&f)
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|s| s["child"].is_object())
+    });
+    let output = f
+        .command()
+        .args(["switch", "b", "--only", "a"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = controls(&f);
+    for s in after.as_object().unwrap().values() {
+        if s["alias"] == "a" {
+            assert_eq!(s["request"]["alias"], "b");
+        } else {
+            assert!(s["request"].is_null());
+        }
+    }
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "a");
+}
+
+#[test]
+fn failed_shared_restore_does_not_flip_selection_or_queue_moves() {
+    let f = interactive_fixture();
+    let _one = start_interactive(&f, "a", true);
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["child"].is_object())
+    });
+    fs::remove_file(f.source.join(".credentials.json")).unwrap();
+    fs::create_dir(f.source.join(".credentials.json")).unwrap();
+    let output = f.command().args(["switch", "b", "--yes"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("switching to 'b'"));
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "a");
+    assert!(controls(&f)
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|s| s["request"].is_null()));
+}
+
+#[test]
+fn plain_switch_reapplies_current_shared_login_and_moves_other_aliases() {
+    let f = interactive_fixture();
+    let _one = start_interactive(&f, "c", false);
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["busy"] == false)
+    });
+    fs::write(
+        f.source.join(".claude.json"),
+        json!({"oauthAccount":{"emailAddress":"drifted@x"}}).to_string(),
+    )
+    .unwrap();
+    let output = f.command().args(["switch", "a", "--yes"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shared: Value =
+        serde_json::from_slice(&fs::read(f.source.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(shared["oauthAccount"]["emailAddress"], "a@x");
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|s| s["alias"] == "a" && s["switching"] == false)
+    });
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "a");
+    assert!(state["providers"]["claude"]["previous"].is_null());
+}

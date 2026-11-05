@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
     args_conflicts_with_subcommands = true,
     after_help = "Agent guide: cs --llm
 Examples: cs run -- --resume pm
-          cs switch work --from personal
+          cs switch work --only personal
           cs switch work --session <UUID> --interrupt"
 )]
 struct Cli {
@@ -66,20 +66,30 @@ Interactive login masks input with *; press Enter after pasting."
         #[arg(long)]
         switch: bool,
     },
-    /// Change the shared login, or move selected conversations to a destination account
-    #[command(after_help = "Targeted: cs switch DEST --from SOURCE
+    /// Change shared login and move all managed conversations, or only selected ones
+    #[command(after_help = "Plain:    cs switch DEST [--yes]
+Targeted: cs switch DEST --only ALIAS (also --from ALIAS)
           cs switch DEST --session UUID [--interrupt]
 Get UUIDs with cs sessions in another terminal; no restart needed.
 Without --interrupt, queue a restart after Claude's idle notification, typically
 about 60 seconds after its response with no background agents. Use --interrupt
 for sessions waiting for a quota reset. A restart resumes the same conversation.
 Only updated cs run launchers support targeted switching. Check cs sessions
-for pending moves or failures. Without a target, switch changes the shared login.")]
+for pending moves or failures. Plain switch changes shared login and queues all
+supported managed conversations not already on DEST; unsupported ones are reported.
+Selectors leave shared login unchanged. Key destinations clear shared OAuth in plain
+mode and use API-key authentication for managed restarts. Key-bound conversations
+cannot change accounts again; start a new conversation for another account.")]
     Switch {
         /// Destination alias or, for targeted moves, email; plain switch also accepts - and next
         alias: String,
         /// Move live managed conversations from this account to the destination
-        #[arg(long, conflicts_with = "session", group = "target")]
+        #[arg(
+            long = "only",
+            visible_alias = "from",
+            conflicts_with = "session",
+            group = "target"
+        )]
         from: Option<String>,
         /// Move only this live conversation (UUID from cs sessions)
         #[arg(long, conflicts_with = "from", group = "target")]
@@ -278,6 +288,28 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cs", "switch", "b", "--from", "a", "--session", "root"]).is_err()
         );
+    }
+
+    #[test]
+    fn only_and_from_select_the_same_alias_and_conflict_with_session() {
+        for flag in ["--only", "--from"] {
+            let cli = Cli::try_parse_from(["cs", "switch", "carraes", flag, "carlos2"]).unwrap();
+            let Some(Commands::Switch { from, session, .. }) = cli.command else {
+                panic!("expected switch")
+            };
+            assert_eq!(from.as_deref(), Some("carlos2"));
+            assert!(session.is_none());
+            assert!(Cli::try_parse_from([
+                "cs",
+                "switch",
+                "carraes",
+                flag,
+                "carlos2",
+                "--session",
+                "root"
+            ])
+            .is_err());
+        }
     }
 
     #[test]
