@@ -297,7 +297,7 @@ mod tests {
         let accounts = dir.join("state.json");
         let observation = dir.join("usage.json");
         let mut state = State::default();
-        state.claude_mut().accounts.insert("a".into(),Account{email:"a@x".into(),data:json!({"claudeAiOauth":{"accessToken":"upstream-secret","expiresAt":(usage::now()+7200)*1000}})});
+        state.claude_mut().accounts.insert("a".into(),Account{kind: None, email:"a@x".into(),data:json!({"claudeAiOauth":{"accessToken":"upstream-secret","expiresAt":(usage::now()+7200)*1000}})});
         std::fs::write(&accounts, serde_json::to_vec(&state).unwrap()).unwrap();
         let obs = Observation {
             accounts: BTreeMap::from([(

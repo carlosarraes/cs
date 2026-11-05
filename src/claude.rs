@@ -236,7 +236,7 @@ fn write_active_oauth(value: &Value) -> Result<()> {
 /// pinned `/usr/bin/security`, mirroring how Claude Code (and claude-swap)
 /// access the `Claude Code-credentials` generic-password item.
 #[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use crate::util::patch_value;
     use anyhow::{anyhow, Context, Result};
     use serde_json::Value;
@@ -247,6 +247,43 @@ mod macos {
     const SERVICE: &str = "Claude Code-credentials";
     const NOT_FOUND_RC: i32 = 44; // errSecItemNotFound
     const STDIN_LINE_LIMIT: usize = 4096 - 64; // security -i reads stdin with a BUFSIZ fgets buffer
+
+    fn key_service(alias: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("cs-api-key-{:x}", Sha256::digest(alias.as_bytes()))
+    }
+
+    pub fn read_key(alias: &str) -> Result<Option<String>> {
+        get(&account(), &key_service(alias))
+            .map_err(|_| anyhow!("could not read API key from Keychain"))
+    }
+
+    pub fn save_key(alias: &str, secret: &str) -> Result<()> {
+        let service = key_service(alias);
+        // API secrets must always fit the stdin protocol; never use the argv fallback.
+        if secret.len() * 2 + quote(&account()).len() + service.len() + 64 > STDIN_LINE_LIMIT {
+            return Err(anyhow!("key credential exceeds Keychain input limit"));
+        }
+        set(&account(), &service, secret).map_err(|_| anyhow!("could not save API key in Keychain"))
+    }
+
+    pub fn delete_key(alias: &str) -> Result<()> {
+        let output = Command::new(SECURITY)
+            .args([
+                "delete-generic-password",
+                "-a",
+                &account(),
+                "-s",
+                &key_service(alias),
+            ])
+            .output()
+            .context("deleting API key from Keychain")?;
+        if output.status.success() || output.status.code() == Some(NOT_FOUND_RC) {
+            Ok(())
+        } else {
+            Err(anyhow!("could not delete API key from Keychain"))
+        }
+    }
 
     fn profile_service(path: &std::path::Path) -> Result<String> {
         use sha2::{Digest, Sha256};

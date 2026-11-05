@@ -55,6 +55,9 @@ fn apply_snapshot(ps: &mut ProviderState, alias: &str, email: &str, data: Value)
     let Some(acct) = ps.accounts.get_mut(alias) else {
         return Refreshed::Skipped;
     };
+    if acct.is_key() {
+        return Refreshed::Skipped;
+    }
     if acct.email != email && acct.email != "unknown" {
         return Refreshed::Mismatch {
             live: email.to_string(),
@@ -98,6 +101,53 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
     ps.current = Some(target.to_string());
 }
 
+pub fn add_key(alias: &str, admin: bool) -> Result<()> {
+    validate_alias(alias)?;
+    let _credentials = crate::accounts::credential_lock()?;
+    let _lock = state::lock()?;
+    let mut state = State::load()?;
+    if state.claude().accounts.contains_key(alias) {
+        return Err(anyhow!(
+            "alias '{alias}' already exists; delete it before adding a key"
+        ));
+    }
+    let key = crate::login::read_secret("Anthropic API key: ")?;
+    crate::accounts::validate_key(&key, false)?;
+    let admin_key = if admin {
+        let secret = crate::login::read_secret("Organization admin key: ")?;
+        crate::accounts::validate_key(&secret, true)?;
+        Some(secret)
+    } else {
+        None
+    };
+    let hint = crate::accounts::key_hint(&key);
+    crate::accounts::save_key(
+        alias,
+        &crate::accounts::KeySecrets {
+            key,
+            admin: admin_key,
+        },
+    )?;
+    state.claude_mut().accounts.insert(
+        alias.into(),
+        Account {
+            kind: Some(state::AccountKind::ApiKey {
+                key_hint: hint.clone(),
+                key_id: None,
+                admin_ref: admin.then(|| alias.into()),
+            }),
+            email: String::new(),
+            data: serde_json::json!({}),
+        },
+    );
+    if let Err(error) = state.save() {
+        let _ = crate::accounts::delete_key(alias);
+        return Err(error);
+    }
+    println!("Saved '{alias}' [key] {hint}. Use cs run --account {alias}.");
+    Ok(())
+}
+
 pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> {
     let _credentials = crate::accounts::credential_lock()?;
     validate_alias(alias)?;
@@ -107,6 +157,16 @@ pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> 
         return Err(anyhow!(
             "alias '{alias}' already exists (run `cs refresh` to update its saved \
              credentials, `--force` to overwrite it, or `cs del {alias}` first)"
+        ));
+    }
+    if state
+        .claude()
+        .accounts
+        .get(alias)
+        .is_some_and(Account::is_key)
+    {
+        return Err(anyhow!(
+            "delete the key alias before replacing it with a subscription"
         ));
     }
 
@@ -151,6 +211,7 @@ pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> 
     state.claude_mut().accounts.insert(
         alias.to_string(),
         Account {
+            kind: None,
             email: email.clone(),
             data: data.clone(),
         },
@@ -198,6 +259,9 @@ pub fn switch(requested: &str, yes: bool) -> Result<()> {
     if !state.claude().accounts.contains_key(&target) {
         return Err(anyhow!("unknown alias '{target}' (see `cs list`)"));
     }
+    if state.claude().accounts[&target].is_key() {
+        return Err(anyhow!("key accounts require cs run --account {target}"));
+    }
     if state.claude().current.as_deref() == Some(target.as_str()) {
         println!("Already on '{target}'.");
         return Ok(());
@@ -235,6 +299,14 @@ fn next_target(ps: &ProviderState) -> Result<String> {
 /// The caller holds `state::lock()` and has validated `target`. Returns the
 /// target's email.
 pub fn perform_switch(state: &mut State, target: &str) -> Result<String> {
+    if state
+        .claude()
+        .accounts
+        .get(target)
+        .is_some_and(Account::is_key)
+    {
+        return Err(anyhow!("key accounts require cs run --account {target}"));
+    }
     // Re-capture the outgoing account so rotated refresh tokens aren't lost.
     if let Some(cur) = state.claude().current.clone() {
         if let Refreshed::Mismatch { live, saved } = refresh_snapshot(state.claude_mut(), &cur) {
@@ -288,9 +360,11 @@ pub fn del(alias: &str) -> Result<()> {
     let _lock = state::lock()?;
     let mut state = State::load()?;
     let ps = state.claude_mut();
-    if ps.accounts.remove(alias).is_none() {
+    if !ps.accounts.contains_key(alias) {
         return Err(anyhow!("unknown alias '{alias}'"));
     }
+    crate::accounts::delete_key(alias)?;
+    ps.accounts.remove(alias);
     if ps.current.as_deref() == Some(alias) {
         ps.current = None;
     }
@@ -317,7 +391,11 @@ pub fn list() -> Result<()> {
         } else {
             ' '
         };
-        println!("{marker} {alias:<16} {}", acct.email);
+        if let Some(hint) = acct.key_hint() {
+            println!("{marker} {alias:<16} [key] {hint}");
+        } else {
+            println!("{marker} {alias:<16} {}", acct.email);
+        }
     }
     Ok(())
 }
@@ -383,6 +461,9 @@ pub fn refresh_current_if_stale() -> Result<Option<String>> {
     let Some(acct) = state.claude().accounts.get(&alias) else {
         return Ok(None);
     };
+    if acct.is_key() {
+        return Ok(None);
+    }
     let Some(live) = claude::live_oauth()? else {
         return Ok(None);
     };
@@ -422,6 +503,9 @@ fn refresh_is_owned(
     account: &Account,
     live: Option<&(String, Value)>,
 ) -> bool {
+    if account.is_key() {
+        return false;
+    }
     let Some((email, data)) = live else {
         return false;
     };
@@ -488,6 +572,9 @@ pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
         .accounts
         .get(alias)
         .context("native account was removed")?;
+    if account.is_key() {
+        return Ok(());
+    }
     if account.email != email {
         return Err(anyhow!(
             "{alias}: account identity changed; refusing credential renewal"
@@ -590,7 +677,7 @@ fn matched_alias(ps: &ProviderState, email: &str) -> Option<String> {
     }
     ps.accounts
         .iter()
-        .find(|(_, a)| a.email == email)
+        .find(|(_, a)| !a.is_key() && a.email == email)
         .map(|(name, _)| name.clone())
 }
 
@@ -601,6 +688,7 @@ mod tests {
 
     fn acct(email: &str) -> Account {
         Account {
+            kind: None,
             email: email.into(),
             data: json!({"token": email}),
         }
@@ -620,6 +708,7 @@ mod tests {
     #[test]
     fn locked_shared_keychain_does_not_block_other_accounts() {
         let account = Account {
+            kind: None,
             email: "work@x".into(),
             data: json!({"claudeAiOauth":{"accessToken":"work","refreshToken":"work-refresh"}}),
         };
@@ -654,6 +743,7 @@ mod tests {
     #[test]
     fn refresh_excludes_actual_shared_identity_even_after_login_drift() {
         let account = Account {
+            kind: None,
             email: "b@x".into(),
             data: json!({"claudeAiOauth":{"accessToken":"b","refreshToken":"rb"}}),
         };

@@ -145,6 +145,70 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+pub fn read_secret(prompt: &str) -> Result<String> {
+    let terminal = io::stdin().is_terminal();
+    let _signals = if terminal {
+        Some(Signals::install()?)
+    } else {
+        None
+    };
+    let _terminal = if terminal {
+        Some(Terminal::raw()?)
+    } else {
+        None
+    };
+    let mut output = io::stderr().lock();
+    output.write_all(prompt.as_bytes())?;
+    output.flush()?;
+    let mut line = Vec::new();
+    let mut escape = EscapeState::default();
+    loop {
+        if terminal && INTERRUPTED.load(Ordering::Relaxed) != 0 {
+            return Err(anyhow!("key input interrupted"));
+        }
+        // Read exactly one byte so a second prompt can consume the same piped stdin.
+        let mut byte = [0];
+        let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if n == 0 {
+            break;
+        }
+        let byte = byte[0];
+        if byte != 3 && escape.consume(byte) {
+            continue;
+        }
+        match byte {
+            3 | 4 => return Err(anyhow!("key input cancelled")),
+            b'\r' | b'\n' => break,
+            8 | 127 if !line.is_empty() => {
+                line.pop();
+                if terminal {
+                    output.write_all(b"\x08 \x08")?;
+                }
+            }
+            32..=126 => {
+                if line.len() >= 512 {
+                    return Err(anyhow!("key input too long"));
+                }
+                line.push(byte);
+                if terminal {
+                    output.write_all(b"*")?;
+                }
+            }
+            _ => {}
+        }
+        output.flush()?;
+    }
+    output.write_all(if terminal { b"\r\n" } else { b"\n" })?;
+    String::from_utf8(line).context("invalid key input")
+}
+
 fn interactive(command: &mut Command) -> Result<ExitStatus> {
     let _signals = Signals::install().context("installing login signal handlers")?;
     let mut settings = terminal_settings(0)?;

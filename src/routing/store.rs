@@ -314,7 +314,7 @@ mod tests {
     fn accounts() -> State {
         let mut s = State::default();
         for alias in ["a", "b"] {
-            s.claude_mut().accounts.insert(alias.into(),Account{email:format!("{alias}@x"),data:serde_json::json!({"claudeAiOauth":{"accessToken":alias,"expiresAt":(now()+7200)*1000}})});
+            s.claude_mut().accounts.insert(alias.into(),Account{kind: None, email:format!("{alias}@x"),data:serde_json::json!({"claudeAiOauth":{"accessToken":alias,"expiresAt":(now()+7200)*1000}})});
         }
         s
     }

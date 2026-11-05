@@ -617,6 +617,7 @@ mod tests {
     #[test]
     fn drifted_live_login_cannot_supply_another_alias_usage() {
         let account = crate::state::Account {
+            kind: None,
             email: "a@x".into(),
             data: serde_json::json!({"claudeAiOauth":{"accessToken":"a"}}),
         };

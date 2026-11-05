@@ -702,7 +702,7 @@ mod tests {
     fn accounts() -> state::State {
         let mut state = state::State::default();
         state.claude_mut().accounts.insert("work".into(), state::Account {
-            email: "carlos@mondrio.io".into(),
+            kind: None, email: "carlos@mondrio.io".into(),
             data: serde_json::json!({"claudeAiOauth":{"accessToken":"secret-test-token","expiresAt":2000000}}),
         });
         state

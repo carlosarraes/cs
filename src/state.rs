@@ -19,8 +19,36 @@ use crate::util;
 /// (Claude: `{claudeAiOauth, oauthAccount}`; Codex: the raw `auth.json`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Account {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AccountKind>,
     pub email: String,
     pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AccountKind {
+    Subscription,
+    ApiKey {
+        key_hint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_ref: Option<String>,
+    },
+}
+
+impl Account {
+    pub fn is_key(&self) -> bool {
+        matches!(self.kind, Some(AccountKind::ApiKey { .. }))
+    }
+
+    pub fn key_hint(&self) -> Option<&str> {
+        match &self.kind {
+            Some(AccountKind::ApiKey { key_hint, .. }) => Some(key_hint),
+            _ => None,
+        }
+    }
 }
 
 /// Deserialize tolerantly: accept the current `{email, data}` shape, and also the
@@ -40,6 +68,12 @@ impl<'de> Deserialize<'de> for Account {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let kind = obj
+            .remove("kind")
+            .map(serde_json::from_value::<Option<AccountKind>>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .flatten();
         let data = match obj.remove("data") {
             Some(data) => data,
             None => {
@@ -52,7 +86,7 @@ impl<'de> Deserialize<'de> for Account {
                 Value::Object(d)
             }
         };
-        Ok(Account { email, data })
+        Ok(Account { kind, email, data })
     }
 }
 
@@ -236,5 +270,21 @@ mod tests {
         let modern: Account =
             serde_json::from_value(json!({"email":"a","data":{"foo":1}})).unwrap();
         assert_eq!(modern.data["foo"], json!(1));
+        assert!(!legacy.is_key());
+        assert!(!modern.is_key());
+        assert!(modern.kind.is_none());
+    }
+
+    #[test]
+    fn key_metadata_round_trips_without_credentials() {
+        let account: Account = serde_json::from_value(json!({
+            "kind":{"type":"api_key","key_hint":"sk-ant-…ABCD","key_id":"apikey_123"}
+        }))
+        .unwrap();
+        assert!(account.is_key());
+        assert_eq!(account.key_hint(), Some("sk-ant-…ABCD"));
+        let back = serde_json::to_value(&account).unwrap();
+        assert_eq!(back["kind"]["key_id"], "apikey_123");
+        assert!(back["kind"].get("admin_ref").is_none());
     }
 }

@@ -1,5 +1,102 @@
 use crate::{claude, commands, routing::store::Store, state, usage};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct KeySecrets {
+    pub key: String,
+    pub admin: Option<String>,
+}
+
+pub fn validate_key(key: &str, admin: bool) -> Result<()> {
+    let valid = key.len() > 20
+        && key.len() <= 512
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        && if admin {
+            key.starts_with("sk-ant-admin")
+        } else {
+            key.starts_with("sk-ant-") && !key.starts_with("sk-ant-admin")
+        };
+    anyhow::ensure!(
+        valid,
+        "invalid Anthropic {}key",
+        if admin { "admin " } else { "API " }
+    );
+    Ok(())
+}
+
+pub fn key_hint(key: &str) -> String {
+    let tail = key.get(key.len().saturating_sub(4)..).unwrap_or("????");
+    format!("sk-ant-…{tail}")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn key_credentials_path() -> Result<std::path::PathBuf> {
+    Ok(state::state_path()?.with_file_name("key-credentials.json"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn key_credentials() -> Result<std::collections::BTreeMap<String, KeySecrets>> {
+    match std::fs::read(key_credentials_path()?) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid key credential storage")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(_) => anyhow::bail!("could not read key credential storage"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_key(alias: &str) -> Result<KeySecrets> {
+    key_credentials()?
+        .remove(alias)
+        .ok_or_else(|| anyhow::anyhow!("API key is not saved"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn save_key(alias: &str, secret: &KeySecrets) -> Result<()> {
+    let mut saved = key_credentials()?;
+    saved.insert(
+        alias.into(),
+        KeySecrets {
+            key: secret.key.clone(),
+            admin: secret.admin.clone(),
+        },
+    );
+    crate::util::atomic_write(&key_credentials_path()?, &serde_json::to_vec(&saved)?)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn delete_key(alias: &str) -> Result<()> {
+    let mut saved = key_credentials()?;
+    if saved.remove(alias).is_none() {
+        return Ok(());
+    }
+    if saved.is_empty() {
+        std::fs::remove_file(key_credentials_path()?)?;
+        Ok(())
+    } else {
+        crate::util::atomic_write(&key_credentials_path()?, &serde_json::to_vec(&saved)?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_key(alias: &str) -> Result<KeySecrets> {
+    let value =
+        claude::macos::read_key(alias)?.ok_or_else(|| anyhow::anyhow!("API key is not saved"))?;
+    serde_json::from_str(&value).map_err(|_| anyhow::anyhow!("invalid key credential storage"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn save_key(alias: &str, secret: &KeySecrets) -> Result<()> {
+    claude::macos::save_key(alias, &serde_json::to_string(secret)?)
+}
+
+#[cfg(target_os = "macos")]
+pub fn delete_key(alias: &str) -> Result<()> {
+    claude::macos::delete_key(alias)
+}
 
 pub fn credential_lock() -> Result<state::LockGuard> {
     state::lock_at(
@@ -53,6 +150,7 @@ mod tests {
     #[test]
     fn expired_tokens_are_unavailable_even_when_present() {
         let account = crate::state::Account {
+            kind: None,
             email: "a@x".into(),
             data: serde_json::json!({"claudeAiOauth":{"accessToken":"token","expiresAt":1000}}),
         };

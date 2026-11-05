@@ -435,6 +435,7 @@ mod tests {
     }
     fn account() -> state::Account {
         state::Account {
+            kind: None,
             email: "work@x".into(),
             data: json!({"oauthAccount":{"emailAddress":"work@x"},"claudeAiOauth":{"accessToken":"test-secret","refreshToken":"test-refresh","expiresAt":9999999999999i64}}),
         }
