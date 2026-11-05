@@ -9,7 +9,7 @@ cs list                 # Saved aliases and emails
 cs usage                # Subscription quotas and API-key 7d/30d spend
 cs usage --live          # Refresh usage now
 cs sessions             # Live conversation UUIDs, accounts, queued moves/errors
-cs whoami               # Shared login identity, not every managed session
+cs whoami               # Shared OAuth identity or selected key mode
 
 ## Launch or resume
 
@@ -38,13 +38,18 @@ cs del work-api              # Remove the API key secret
 
 `cs list` marks key aliases [key]; only sk-ant-… plus the last four characters is
 shown. Secrets use macOS Keychain or Linux mode-0600 credential storage, never
-state/config. Key accounts require explicit --account and are excluded from
-automatic routing, switch next, shared-login switching, and the proxy.
+state/config. Select a key with cs switch limit, then cs run defaults to that key;
+explicit --account also works. Switching to a key clears shared OAuth and its old
+identity; whoami reports key mode. Unmanaged claude may need cs run to use the key.
+Returning to a subscription restores OAuth and strips key environment variables
+from future subscription launches. Keys are excluded from automatic quota routing,
+switch next, and the proxy.
 
 `cs usage` shows `$X 7d  $Y 30d (as of HH:MM) est.` per key, plus a `local` line
 for all local Claude JSONL usage. Estimates use ccost/ccusage-style token×price
 math from local logs — not billed Anthropic spend. Per-key rows only count sessions
-cs launched with that alias; the local total needs no attribution.
+cs launched or moved to that alias. Moved conversations count only log entries
+at or after the confirmed move; the local total includes the whole transcript.
 
 Token-price totals cover midnight UTC 7/30 days ago through now, not invoices or
 discounts/tools/premium charges. As-of time is local. Unknown models use fallback
@@ -58,15 +63,22 @@ observations remain compatible.
 
 ## Move running conversations
 
-cs switch DEST --from SOURCE
+cs switch carraes                  # Shared login + all managed conversations
+cs switch carraes --only carlos2    # Only conversations on alias carlos2
+cs switch limit                    # Saved API-key destination
+cs switch DEST --from SOURCE       # Alias for --only
 cs switch DEST --session UUID
 cs switch DEST --session UUID --interrupt
 cs switch DEST --from SOURCE --interrupt
 
-DEST is the destination account alias or unique email. --from selects all managed
-conversations on SOURCE. --session selects one UUID from cs sessions.
+Plain switch accepts an alias, - or next. It changes shared login and queues all
+supported managed leases not already on DEST, even if DEST is already current.
+Targets are saved account aliases and their conversations, never hosts.
+With selectors, DEST can also be a unique email. --only ALIAS selects managed
+conversations currently on ALIAS; --from has identical behavior. --session selects
+one UUID from cs sessions. Selectors leave shared login unchanged.
 Run cs sessions in another terminal; finding a UUID does not require a restart.
---from and --session are mutually exclusive.
+--only/--from and --session are mutually exclusive.
 
 Without --interrupt, the move queues until Claude reports idle, typically about
 60 seconds after its response with no background agents. Then cs restarts Claude
@@ -82,7 +94,12 @@ Only sessions launched by a version supporting targeted switching can be moved.
 Older launchers must be reopened once. Headless runs, worktrees, and unsupported
 restart flags cannot be moved automatically. Normal shell directory changes are
 supported; restarts use the original launch project to preserve relative flags.
-Other sessions and the shared login are unaffected by targeted moves.
+Plain switch reports unsupported sessions as skipped and queues supported ones.
+Explicit selectors reject the batch if any selected session is unsupported.
+Subscription conversations can move to a key via key authentication, without OAuth
+quota checks. Key-bound conversations cannot change accounts again; start a new
+conversation for another account. Other sessions and shared login are unaffected
+by moves with selectors.
 
 ## Shared login and account maintenance
 
@@ -90,13 +107,16 @@ cs add work             # Save an account; restore the selected login
 cs add work --current   # Snapshot the live login, then restore the selected account
 cs add work --switch    # Save an account and make it active
 cs refresh              # Update saved account after an external /login
-cs switch work          # Change shared login; may disrupt unmanaged Claude
+cs switch work          # Shared login + queue all supported managed sessions
 cs switch -             # Return to previous shared login
-cs switch next          # Shared login: choose least-used 5h account
+cs switch next          # Choose least-used 5h subscription; shared + managed
 cs del work             # Remove saved alias, not a logout
 
-Plain cs switch is not a targeted session move. Its --yes flag skips the running
-Claude warning; it cannot be combined with --from or --session.
+Plain switch waits for idle. Its --yes flag skips the running-Claude warning and
+cannot be combined with --only, --from or --session. --interrupt requires a selector.
+If shared credential restore/clear fails, saved current stays unchanged and no moves
+are queued. On macOS, SSH/non-GUI Keychain reads can fail with code 36 even when
+an item exists. Retry with Keychain access; never print secrets or disable Keychain.
 
 ## Optional services and snapshots
 

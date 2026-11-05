@@ -55,7 +55,9 @@ cs add work              # log in, save "work", restore the previously selected 
 cs add main --current    # save the live login, then restore the selected account
 cs add work --switch     # log in, save "work", and make it active
 cs add-key work-api      # prompt for an Anthropic API key, with masked input
-cs switch work           # switch to "work"
+cs switch work           # shared login + all managed conversations
+cs switch carraes --only carlos2  # only conversations on carlos2
+cs switch limit          # select a saved API-key alias
 cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
 cs del work              # forget an alias (does not log you out)
@@ -72,7 +74,8 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 |---|---|
 | `cs add <alias> [--current] [--force] [--switch]` | Save an account; restore the selected login unless `--switch` is set |
 | `cs add-key <alias>` | Read an Anthropic API key from masked stdin |
-| `cs switch <alias>` / `cs switch -` | Activate an alias; `-` is the previous one |
+| `cs switch <alias>` / `cs switch -` | Update shared login and queue all managed conversations; `-` is the previous alias |
+| `cs switch <dest> --only <alias>` | Move only conversations on a source alias; `--from` is equivalent |
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
 | `cs whoami` | Show the live signed-in account |
@@ -135,9 +138,14 @@ macOS Keychain or in `$XDG_DATA_HOME/cs/key-credentials.json` on Linux (default
 `~/.local/share/cs/key-credentials.json`), mode 0600. State and config contain
 only a redacted hint. Delete and re-add an alias to replace its key.
 
-API-key aliases require `cs run --account ALIAS`. The selected API key is injected
-as `ANTHROPIC_API_KEY` into that child process only. Key accounts do not participate
-in automatic routing, `cs switch next`, shared login switching, or the proxy.
+Select an API-key alias with `cs switch limit`, then launch with `cs run`, or pin
+it directly with `cs run --account limit`. The key is injected as
+`ANTHROPIC_API_KEY` into the Claude child process only. Switching to a key clears
+shared OAuth and its account identity; `cs whoami` reports the selected key alias
+and redacted hint. Unmanaged `claude` may still need `cs run` to use the key.
+Switching back to a subscription restores OAuth and future subscription launches
+strip API-key environment variables. Keys stay out of automatic quota routing,
+`cs switch next`, and the proxy.
 
 `cs usage` prints one estimated spend row per key, plus a `local` total for every
 Claude Code session on this machine (any account). Figures are token×price estimates
@@ -149,8 +157,9 @@ local  $40.00 7d  $120.00 30d  (as of 21:40) est.
 ```
 
 Claude Code JSONL does not record which API key a request used. Per-alias lines
-therefore count only session ids cs recorded when launching that key, including
-subagent directories. Sessions started outside cs are not attributed to a key, but
+therefore count only session ids cs recorded when launching or moving to that key,
+including subagent directories. For a subscription conversation moved to a key,
+only log entries at or after the confirmed move count toward that key's spend. Sessions started outside cs are not attributed to a key, but
 still appear in the `local` total. Attribution survives closed sessions and router
 restarts; deleting an alias removes its attribution and cached spend. Using another
 login or key outside cs within an attributed conversation makes that alias estimate
@@ -207,14 +216,23 @@ launches; it remains available for usage polling/reports and older proxy clients
 Existing processes are not migrated, restarted, or switched by installing this
 version. Restart only the conversation you want to move to native authentication.
 
-To move running conversations launched by this version, target their current
-account or a conversation UUID from `cs sessions`:
+Plain `cs switch DEST` updates the shared login and queues every supported live
+managed conversation that is not already on DEST. This also works when DEST is
+already the shared selection. Targets are saved account aliases and their managed
+conversations, not machines or hosts. For example:
 
 ```sh
+cs switch carraes
+cs switch limit
+cs switch carraes --only carlos2
 cs switch carlos2 --from carlos3
 cs switch carlos2 --session <conversation-uuid>
 cs switch carlos2 --from carlos3 --interrupt
 ```
+
+`--only ALIAS` selects conversations currently bound to that source alias.
+`--from ALIAS` is an equivalent selector; both conflict with `--session UUID`.
+Selectors leave the shared login unchanged and cannot be combined with `--yes`.
 
 A targeted switch validates the destination and queues a restart of only the
 selected conversations, preserving their UUID, working directory, and supported
@@ -229,9 +247,15 @@ conversation, cs attempts to resume the original account.
 Normal shell directory changes do not prevent switching; the replacement starts
 from the original launch project so relative flags keep their meaning.
 
-Older launchers, headless sessions, worktrees, and unsupported restart flags are rejected without stopping them. Reopen older
-sessions with the updated `cs run` before targeting them. Plain `cs switch <alias>`
-still changes the shared login and retains its existing warning.
+Older launchers, headless sessions, worktrees, and unsupported restart flags cannot
+be restarted automatically. Plain switch reports these sessions as skipped and
+queues the supported ones. An explicit selector rejects the batch if any selected
+session is unsupported. Reopen older sessions with the updated `cs run` first.
+Subscription conversations can move to API-key destinations without subscription
+quota checks. Once key-bound, conversations cannot change accounts again; start a
+new conversation for another account. Key authentication is verified before the
+source process stops. Plain switch retains the running-Claude warning and `--yes`
+bypasses it; moves wait for idle. `--interrupt` requires a selector.
 
 To choose a specific subscription, use an alias or its unique email:
 
@@ -315,7 +339,7 @@ not make additional usage API requests.
 Restart `cs start` after changing configuration. The old `[auto-switcher]`,
 `[report]`, and `[warmup]` sections are ignored with a migration notice. The
 old global auto-switch loop has been removed. `cs switch <alias>` still changes
-the shared login for unmanaged Claude instances; it cannot move managed sessions.
+the shared login and queues moves for managed sessions.
 
 The service installer now starts the router:
 
@@ -379,6 +403,12 @@ A switch patches **only** those keys, so your MCP tokens, project history,
 and settings are never touched. `cs add` captures the account into
 `~/.local/share/cs/state.json` (mode 600), and before switching away `cs`
 re-captures the current account so rotated refresh tokens stay fresh.
+
+On macOS, Keychain access can fail in SSH or other non-GUI sessions even when the
+item exists, for example `security find-generic-password -w` returning code 36.
+A credential restore or clear failure is reported and leaves the saved current
+alias unchanged; managed moves are not queued. Use a session with Keychain access
+and retry. Never print credentials or disable Keychain to diagnose this.
 
 Honors `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 
