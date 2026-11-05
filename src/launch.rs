@@ -41,7 +41,21 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
     let mut accounts = state::State::load()?;
     let forced = requested
         .map(|name| resolve_account(&accounts, name).map(|(alias, _)| alias.to_string()))
-        .transpose()?;
+        .transpose()?
+        .or_else(|| {
+            accounts
+                .claude()
+                .current
+                .as_ref()
+                .filter(|alias| {
+                    accounts
+                        .claude()
+                        .accounts
+                        .get(*alias)
+                        .is_some_and(state::Account::is_key)
+                })
+                .cloned()
+        });
     if forced.is_none()
         && accounts
             .claude()

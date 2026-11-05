@@ -77,6 +77,11 @@ pub fn restore(data: &Value) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_oauth() -> Result<()> {
+    write_active_oauth(&Value::Null)?;
+    patch_json(&global_config_path()?, "oauthAccount", Value::Null)
+}
+
 /// The live `claudeAiOauth` payload (tokens + expiry), or `None` if not signed in.
 /// Claude Code keeps this one fresh, so it's the token to poll usage with.
 pub fn live_oauth() -> Result<Option<Value>> {
@@ -214,7 +219,7 @@ pub fn write_profile_oauth(path: &std::path::Path, oauth: &Value) -> Result<()> 
 
 #[cfg(not(target_os = "macos"))]
 fn read_active_oauth() -> Result<Option<Value>> {
-    read_json_key(&credentials_path()?, "claudeAiOauth")
+    Ok(read_json_key(&credentials_path()?, "claudeAiOauth")?.filter(|v| !v.is_null()))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -318,7 +323,7 @@ pub(crate) mod macos {
         };
         let root: Value = serde_json::from_str(&secret)
             .context("parsing the Claude Code keychain credential as JSON")?;
-        Ok(root.get("claudeAiOauth").cloned())
+        Ok(root.get("claudeAiOauth").filter(|v| !v.is_null()).cloned())
     }
 
     pub fn write_oauth(value: &Value) -> Result<()> {

@@ -195,3 +195,41 @@ fn unsuccessful_login_restores_outgoing_account_without_adding_alias() {
         );
     }
 }
+
+#[test]
+fn adding_subscription_preserves_selected_key_mode_even_if_login_fails() {
+    for mode in ["login", "current", "failure"] {
+        let f = Fixture::new();
+        let mut state = f.read("data/cs/state.json");
+        state["providers"]["claude"]["accounts"]["old"] =
+            json!({"kind":{"type":"api_key","key_hint":"sk-ant-…ABCD"},"email":"","data":{}});
+        f.write("data/cs/state.json", &state);
+        if mode == "current" {
+            f.live("new@example.test");
+        }
+        if mode == "failure" {
+            let fake = f.temp.path().join("bin/claude");
+            let mut script = fs::read_to_string(&fake).unwrap();
+            script.push_str("\nsys.exit(7)\n");
+            fs::write(fake, script).unwrap();
+        }
+        let output = f.add(if mode == "current" {
+            &["new", "--current"]
+        } else {
+            &["new"]
+        });
+        assert_eq!(output.status.success(), mode != "failure");
+        let state = f.read("data/cs/state.json");
+        assert_eq!(state["providers"]["claude"]["current"], "old");
+        assert_eq!(state["providers"]["claude"]["previous"], "previous");
+        assert_eq!(
+            state["providers"]["claude"]["accounts"]
+                .get("new")
+                .is_some(),
+            mode != "failure"
+        );
+        assert!(f.read("claude/.credentials.json")["claudeAiOauth"].is_null());
+        assert!(f.read("claude/.claude.json")["oauthAccount"].is_null());
+        assert_eq!(f.read("claude/.credentials.json")["unrelated"], true);
+    }
+}

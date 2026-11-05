@@ -186,7 +186,7 @@ pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> 
         Err(error) => {
             if !current {
                 if let Some(account) = &original_account {
-                    if claude::restore(&account.data).is_err() {
+                    if restore_shared_account(account).is_err() {
                         return Err(error.context(
                             "the previous login could not be restored after login failed",
                         ));
@@ -209,7 +209,7 @@ pub fn add(alias: &str, current: bool, force: bool, switch: bool) -> Result<()> 
     let reason = if switch {
         None
     } else if let Some(account) = previous_account {
-        if claude::restore(&account.data).is_ok() {
+        if restore_shared_account(&account).is_ok() {
             state.save()?;
             println!("Saved account '{alias}' ({email}); not active. Run `cs switch {alias}` to use it (or add with --switch).");
             return Ok(());
@@ -249,13 +249,6 @@ pub fn switch(requested: &str, yes: bool) -> Result<()> {
     if !state.claude().accounts.contains_key(&target) {
         return Err(anyhow!("unknown alias '{target}' (see `cs list`)"));
     }
-    if state.claude().accounts[&target].is_key() {
-        return Err(anyhow!("key accounts require cs run --account {target}"));
-    }
-    if state.claude().current.as_deref() == Some(target.as_str()) {
-        println!("Already on '{target}'.");
-        return Ok(());
-    }
 
     if !yes && !confirm_if_running()? {
         println!("Aborted.");
@@ -285,18 +278,18 @@ fn next_target(ps: &ProviderState) -> Result<String> {
         })
 }
 
+fn restore_shared_account(account: &Account) -> Result<()> {
+    if account.is_key() {
+        claude::clear_oauth()
+    } else {
+        claude::restore(&account.data)
+    }
+}
+
 /// Re-capture the outgoing account, make `target` live, and record the switch.
 /// The caller holds `state::lock()` and has validated `target`. Returns the
-/// target's email.
+/// target's email or redacted key description.
 pub fn perform_switch(state: &mut State, target: &str) -> Result<String> {
-    if state
-        .claude()
-        .accounts
-        .get(target)
-        .is_some_and(Account::is_key)
-    {
-        return Err(anyhow!("key accounts require cs run --account {target}"));
-    }
     // Re-capture the outgoing account so rotated refresh tokens aren't lost.
     if let Some(cur) = state.claude().current.clone() {
         if let Refreshed::Mismatch { live, saved } = refresh_snapshot(state.claude_mut(), &cur) {
@@ -312,10 +305,18 @@ pub fn perform_switch(state: &mut State, target: &str) -> Result<String> {
         .get(target)
         .ok_or_else(|| anyhow!("unknown alias '{target}'"))?
         .clone();
-    claude::restore(&account.data).with_context(|| format!("switching to '{target}'"))?;
-    record_switch(state.claude_mut(), target);
+    if account.is_key() {
+        crate::accounts::read_key(target)?;
+    }
+    restore_shared_account(&account).with_context(|| format!("switching to '{target}'"))?;
+    if state.claude().current.as_deref() != Some(target) {
+        record_switch(state.claude_mut(), target);
+    }
     state.save()?;
-    Ok(account.email)
+    Ok(account
+        .key_hint()
+        .map(|hint| format!("[key] {hint}"))
+        .unwrap_or(account.email))
 }
 
 /// Returns whether the switch should proceed. If Claude Code is running, warn;
@@ -402,6 +403,16 @@ pub fn list() -> Result<()> {
 pub fn whoami() -> Result<()> {
     let state = State::load()?;
     let ps = state.claude();
+    if let Some((alias, account)) = ps
+        .current
+        .as_ref()
+        .and_then(|alias| ps.accounts.get(alias).map(|account| (alias, account)))
+    {
+        if let Some(hint) = account.key_hint() {
+            println!("{alias} [key] {hint} (selected for cs run)");
+            return Ok(());
+        }
+    }
     let line = match claude::live_email() {
         Ok(Some(email)) => {
             let tag = matched_alias(ps, &email)

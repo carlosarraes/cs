@@ -223,13 +223,29 @@ printf 'KEY_CHILD_OK\n'
         }
     }
     scan(&f.0.path().join("data"));
+    assert!(f
+        .command()
+        .args(["switch", "work-api", "--yes"])
+        .output()
+        .unwrap()
+        .status
+        .success());
     let automatic = f
         .command()
         .args(["run", "--", "-p", "hi"])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("TEST_EXPECTED_KEY", key())
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(!automatic.status.success());
+    assert!(
+        automatic.status.success(),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
     let switch = f
         .command()
         .args(["switch", "next", "--yes"])
@@ -301,4 +317,86 @@ printf '%s' '{"session_id":"1b48e828-81df-469f-801f-4c268d29d8b2","hook_event_na
         serde_json::from_slice(&fs::read(f.0.path().join("data/cs/routing.json")).unwrap())
             .unwrap();
     assert!(registry["key_sessions"].get(root).is_none());
+}
+
+#[test]
+fn plain_key_switch_clears_only_shared_oauth_and_reports_key_mode() {
+    let f = Fixture::new();
+    assert!(f.add().status.success());
+    let source = f.0.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"fixture-oauth"},"mcpOAuth":{"keep":true}}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"old@x"},"keep":true}"#,
+    )
+    .unwrap();
+    let output = f
+        .command()
+        .args(["switch", "work-api", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.0.path().join("data/cs/state.json")).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "work-api");
+    let credentials: Value =
+        serde_json::from_slice(&fs::read(source.join(".credentials.json")).unwrap()).unwrap();
+    assert!(credentials["claudeAiOauth"].is_null());
+    assert_eq!(credentials["mcpOAuth"]["keep"], true);
+    let config: Value =
+        serde_json::from_slice(&fs::read(source.join(".claude.json")).unwrap()).unwrap();
+    assert!(config["oauthAccount"].is_null());
+    assert_eq!(config["keep"], true);
+    let who = f.command().arg("whoami").output().unwrap();
+    let listed = f.command().arg("list").output().unwrap();
+    assert!(String::from_utf8_lossy(&who.stdout).contains("work-api [key]"));
+    assert!(!String::from_utf8_lossy(&who.stdout).contains("old@x"));
+    assert!(String::from_utf8_lossy(&listed.stdout).starts_with("* work-api"));
+    for bytes in [
+        &output.stdout,
+        &output.stderr,
+        &who.stdout,
+        &who.stderr,
+        &listed.stdout,
+    ] {
+        assert!(!String::from_utf8_lossy(bytes).contains(&key()));
+    }
+}
+
+#[test]
+fn next_ignores_keys_even_with_cached_quota_in_a_mixed_account_set() {
+    let f = Fixture::new();
+    assert!(f.add().status.success());
+    let path = f.0.path().join("data/cs/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["providers"]["claude"]["current"] = serde_json::json!("work-api");
+    state["providers"]["claude"]["accounts"]["subscription"] = serde_json::json!({"email":"sub@x", "data":{"claudeAiOauth":{"accessToken":"expired-fixture","expiresAt":1},"oauthAccount":{"emailAddress":"sub@x"}}});
+    fs::write(&path, state.to_string()).unwrap();
+    fs::write(f.0.path().join("data/cs/usage.json"), serde_json::json!({"observed_at":chrono::Utc::now().timestamp(),"accounts":{"work-api":{"reading":{"status":"known","five_hour":{"utilization":0}},"fetched_at":chrono::Utc::now().timestamp()}}}).to_string()).unwrap();
+    let output = f
+        .command()
+        .args(["switch", "next", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(state["providers"]["claude"]["current"], "subscription");
+    assert_eq!(state["providers"]["claude"]["previous"], "work-api");
+    let shared: Value =
+        serde_json::from_slice(&fs::read(f.0.path().join("claude/.credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(shared["claudeAiOauth"]["accessToken"], "expired-fixture");
 }
