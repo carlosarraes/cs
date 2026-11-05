@@ -140,6 +140,14 @@ pub fn poll() -> Result<()> {
     // Poll saved credentials, never a possibly drifted shared login.
     ps.current = None;
     let mut observed = usage::observe(&ps, previous.as_ref(), usage::now(), 60);
+    usage::observe_spend(
+        &ps,
+        previous.as_ref(),
+        &mut observed,
+        usage::now(),
+        &crate::config::load()?.spend,
+        false,
+    );
     observed.current = state.claude().current.clone();
     usage::carry_timers(previous.as_ref(), &mut observed, usage::now());
     observed.save()

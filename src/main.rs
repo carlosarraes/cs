@@ -13,6 +13,7 @@ mod proxy;
 mod routing;
 mod session_control;
 mod snapshot;
+mod spend;
 mod state;
 mod usage;
 mod util;

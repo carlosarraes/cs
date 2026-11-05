@@ -18,6 +18,8 @@ pub struct Binding {
 pub struct Assignments {
     pub leases: BTreeMap<String, Lease>,
     pub bindings: BTreeMap<String, Binding>,
+    #[serde(default)]
+    pub key_sessions: BTreeMap<String, String>,
 }
 impl Assignments {
     pub fn counts(&self) -> BTreeMap<String, usize> {

@@ -12,6 +12,11 @@ use crate::{claude, config, policy};
 const RESERVED: &[&str] = &["-", "next"];
 
 fn validate_alias(alias: &str) -> Result<()> {
+    if alias.contains("sk-ant-") {
+        return Err(anyhow!(
+            "enter API keys only at the masked add-key prompt; choose a separate alias"
+        ));
+    }
     let ok = !alias.is_empty()
         && !RESERVED.contains(&alias)
         && alias
@@ -365,6 +370,14 @@ pub fn del(alias: &str) -> Result<()> {
     }
     crate::accounts::delete_key(alias)?;
     ps.accounts.remove(alias);
+    crate::routing::store::Store::default_path()?.update(|s| {
+        s.key_sessions.retain(|_, saved| saved != alias);
+        Ok(())
+    })?;
+    if let Some(mut obs) = Observation::load()? {
+        obs.accounts.remove(alias);
+        obs.save()?;
+    }
     if ps.current.as_deref() == Some(alias) {
         ps.current = None;
     }
@@ -637,7 +650,8 @@ pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
 /// or polled right now with `--live`.
 pub fn usage(live: bool) -> Result<()> {
     let now = usage::now();
-    let obs = if live {
+    let previous = Observation::load()?;
+    let mut obs = if live {
         for (alias, res) in refresh_idle_expired(|_| false)? {
             if let Err(e) = res {
                 eprintln!("{alias}: {e:#}");
@@ -648,13 +662,40 @@ pub fn usage(live: bool) -> Result<()> {
         if ps.accounts.is_empty() {
             return Err(anyhow!("no accounts saved yet (see `cs add`)"));
         }
-        let obs = usage::observe(ps, Observation::load()?.as_ref(), now, 0);
-        obs.save()?;
-        obs
+        usage::observe(ps, previous.as_ref(), now, 0)
     } else {
-        Observation::load()?
-            .ok_or_else(|| anyhow!("no observation yet — run `cs start` (or `cs usage --live`)"))?
+        match previous.clone() {
+            Some(obs) => obs,
+            None if State::load()?
+                .claude()
+                .accounts
+                .values()
+                .any(Account::is_key) =>
+            {
+                Observation::default()
+            }
+            None => {
+                return Err(anyhow!(
+                    "no observation yet — run `cs start` (or `cs usage --live`)"
+                ))
+            }
+        }
     };
+    let state = State::load()?;
+    obs.accounts
+        .retain(|alias, _| state.claude().accounts.contains_key(alias));
+    if obs.observed_at == 0 {
+        obs.observed_at = now;
+    }
+    usage::observe_spend(
+        state.claude(),
+        previous.as_ref(),
+        &mut obs,
+        now,
+        &config::load()?.spend,
+        live,
+    );
+    obs.save()?;
     let counts = crate::routing::store::Store::default_path()?.update(|s| Ok(s.counts()))?;
     for line in usage::format_lines_with_counts(&obs, now, usage::colors_enabled(), &counts) {
         println!("{line}");
