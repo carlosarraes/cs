@@ -348,6 +348,10 @@ fn spawn_managed(
 fn checked_destination(name: &str) -> Result<(String, state::Account)> {
     let saved = state::State::load()?;
     let (alias, account) = resolve_account(&saved, name)?;
+    if account.is_key() {
+        crate::accounts::read_key(alias)?;
+        return Ok((alias.into(), account.clone()));
+    }
     if let Err(error) = crate::commands::renew_native_account(alias, &account.email) {
         eprintln!("cs: {alias}: credential renewal unavailable: {error}");
     }
@@ -402,8 +406,13 @@ fn prepare_move(
     }
     let resumed = crate::session_control::resume_args(args, &session.root)?;
     let profile = crate::native::prepare(&alias, &account, source)?;
-    crate::native::verify(&profile, &alias, &account.email)?;
-    let mut next = crate::native::command(&profile, resumed.clone())?;
+    let mut next = if account.is_key() {
+        crate::native::verify_key(&profile, &alias)?;
+        crate::native::key_command(&profile, resumed.clone(), &alias)?
+    } else {
+        crate::native::verify(&profile, &alias, &account.email)?;
+        crate::native::command(&profile, resumed.clone())?
+    };
     next.env("CS_NATIVE_LEASE", token).current_dir(&session.cwd);
     let original_profile = crate::native::profile_path(&session.alias)?;
     crate::native::verify(&original_profile, &session.alias, &session.email)?;
@@ -432,7 +441,7 @@ fn supervise(
     email: &str,
     args: &[OsString],
     source: &std::path::Path,
-    renew_credentials: bool,
+    mut renew_credentials: bool,
 ) -> Result<std::process::ExitStatus> {
     use std::{
         io::IsTerminal,
@@ -509,6 +518,7 @@ fn supervise(
                             })?;
                             eprintln!("cs: {}: switch failed; conversation restored on {}", move_.root, move_.old_alias);
                         }
+                        renew_credentials = state::State::load()?.claude().accounts.get(&active_alias).is_some_and(|a| !a.is_key());
                         moving = None;
                     } else if move_.since.elapsed() > Duration::from_secs(60) {
                         let _ = child.0.kill();

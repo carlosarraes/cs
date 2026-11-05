@@ -20,6 +20,9 @@ pub struct Assignments {
     pub bindings: BTreeMap<String, Binding>,
     #[serde(default)]
     pub key_sessions: BTreeMap<String, String>,
+    // A moved conversation keeps its subscription transcript; only newer entries belong to the key.
+    #[serde(default)]
+    pub key_session_started_at_ms: BTreeMap<String, i64>,
 }
 impl Assignments {
     pub fn counts(&self) -> BTreeMap<String, usize> {

@@ -152,7 +152,15 @@ impl Controls {
             }
             if let Some(target) = session.starting.clone().filter(|_| kind == "SessionStart") {
                 if session.root != root { bail!("replacement resumed a different conversation"); }
+                let saved = state::State::load()?;
+                let account = saved.claude().accounts.get(&target.alias).context("destination account was removed")?;
+                if account.email != target.email { bail!("destination account identity changed"); }
+                let key_destination = account.is_key();
                 crate::routing::store::Store::default_path()?.update(|s| {
+                    if key_destination {
+                        s.key_sessions.insert(root.into(), target.alias.clone());
+                        s.key_session_started_at_ms.entry(root.into()).or_insert_with(|| chrono::Utc::now().timestamp_millis());
+                    }
                     let lease = s.leases.get_mut(token).context("session lease disappeared during switch")?;
                     lease.root = Some(root.into());
                     if let Some(child) = &session.child {
@@ -164,6 +172,9 @@ impl Controls {
                     });
                     Ok(())
                 })?;
+                if key_destination {
+                    session.unsupported = Some("API key conversations cannot change accounts; start a new conversation".into());
+                }
                 session.alias = target.alias;
                 session.email = target.email;
                 session.starting = None;

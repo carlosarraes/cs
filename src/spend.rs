@@ -88,6 +88,7 @@ impl Usage {
 
 struct Row {
     time: i64,
+    time_millis: i64,
     session: String,
     id: Option<String>,
     request: Option<String>,
@@ -128,8 +129,10 @@ fn parse_line(line: &str) -> Option<Row> {
         }
     }
     let usage: Usage = serde_json::from_value(value["message"]["usage"].clone()).ok()?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value["timestamp"].as_str()?).ok()?;
     Some(Row {
-        time: crate::usage::parse_rfc3339(value["timestamp"].as_str()?)?,
+        time: timestamp.timestamp(),
+        time_millis: timestamp.timestamp_millis(),
         session: value["sessionId"].as_str()?.into(),
         id: value["message"]["id"].as_str().map(String::from),
         request: value["requestId"].as_str().map(String::from),
@@ -144,6 +147,7 @@ fn parse_line(line: &str) -> Option<Row> {
 fn estimate(
     projects: &Path,
     sessions: &BTreeMap<String, String>,
+    started_at: &BTreeMap<String, i64>,
     alias: Option<&str>,
     now: i64,
     prices: &Pricing,
@@ -183,7 +187,11 @@ fn estimate(
                     continue;
                 };
                 if let Some(alias) = alias {
-                    if sessions.get(&row.session).is_none_or(|a| a != alias) {
+                    if sessions.get(&row.session).is_none_or(|a| a != alias)
+                        || started_at
+                            .get(&row.session)
+                            .is_some_and(|start| row.time_millis < *start)
+                    {
                         continue;
                     }
                 }
@@ -226,22 +234,34 @@ fn projects_dir() -> Result<std::path::PathBuf> {
     Ok(source.join("projects"))
 }
 
-fn key_sessions() -> Result<BTreeMap<String, String>> {
-    crate::routing::store::Store::default_path()
-        .and_then(|s| s.update(|s| Ok(s.key_sessions.clone())))
-        .map_err(|_| Error::new("session assignments unavailable"))
-}
-
 pub fn poll(alias: &str, account: &Account, now: i64, prices: &Pricing) -> Result<Totals> {
     let Some(AccountKind::ApiKey { .. }) = &account.kind else {
         return Err(Error::new("not an API key account"));
     };
-    let sessions = key_sessions()?;
-    estimate(&projects_dir()?, &sessions, Some(alias), now, prices)
+    let (sessions, started_at) = crate::routing::store::Store::default_path()
+        .and_then(|s| {
+            s.update(|s| Ok((s.key_sessions.clone(), s.key_session_started_at_ms.clone())))
+        })
+        .map_err(|_| Error::new("session assignments unavailable"))?;
+    estimate(
+        &projects_dir()?,
+        &sessions,
+        &started_at,
+        Some(alias),
+        now,
+        prices,
+    )
 }
 
 pub fn poll_local(now: i64, prices: &Pricing) -> Result<Totals> {
-    estimate(&projects_dir()?, &BTreeMap::new(), None, now, prices)
+    estimate(
+        &projects_dir()?,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+        now,
+        prices,
+    )
 }
 
 #[cfg(test)]
@@ -288,6 +308,7 @@ mod tests {
         let total = estimate(
             d.path(),
             &sessions,
+            &BTreeMap::new(),
             Some("work-api"),
             NOW,
             &Pricing::default(),
@@ -296,12 +317,27 @@ mod tests {
         assert!((total.seven_day_usd - 0.002325).abs() < 1e-10);
         assert_eq!(total.seven_day_usd, total.thirty_day_usd);
         assert_eq!(
-            estimate(d.path(), &sessions, Some("other"), NOW, &Pricing::default())
-                .unwrap()
-                .thirty_day_usd,
+            estimate(
+                d.path(),
+                &sessions,
+                &BTreeMap::new(),
+                Some("other"),
+                NOW,
+                &Pricing::default()
+            )
+            .unwrap()
+            .thirty_day_usd,
             0.
         );
-        let all = estimate(d.path(), &sessions, None, NOW, &Pricing::default()).unwrap();
+        let all = estimate(
+            d.path(),
+            &sessions,
+            &BTreeMap::new(),
+            None,
+            NOW,
+            &Pricing::default(),
+        )
+        .unwrap();
         assert!(all.thirty_day_usd > total.thirty_day_usd);
     }
 

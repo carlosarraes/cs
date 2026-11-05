@@ -280,10 +280,16 @@ fn interactive_fixture() -> Fixture {
     fs::write(f.bin.join("claude"), r#"#!/usr/bin/env python3
 import json,os,sys,pathlib,time,subprocess
 profile=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
-email=json.loads((profile/'.claude.json').read_text())['oauthAccount']['emailAddress']
+key=os.environ.get('ANTHROPIC_API_KEY','')
+assert not os.environ.get('ANTHROPIC_AUTH_TOKEN') and not os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') and not os.environ.get('ANTHROPIC_BASE_URL')
+if key:
+ assert key=='sk-ant-api03-fixture-private-ABCD'
+ email='key'
+else:
+ email=json.loads((profile/'.claude.json').read_text())['oauthAccount']['emailAddress']
 args=sys.argv[1:]
 if 'auth' in args:
- print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty','email':email}));sys.exit(0)
+ print(json.dumps({'loggedIn':True,'authMethod':'api_key' if key else 'claude.ai','apiProvider':'firstParty','email':email}));sys.exit(0)
 root=args[args.index('--resume')+1] if '--resume' in args else args[args.index('--session-id')+1]
 test=pathlib.Path(os.environ['TEST_CONTROL_DIR'])
 with (test/'launches.jsonl').open('a') as out:out.write(json.dumps({'root':root,'email':email,'pid':os.getpid(),'args':args,'cwd':os.getcwd()})+'\n')
@@ -907,6 +913,141 @@ fn failed_shared_restore_does_not_flip_selection_or_queue_moves() {
         .unwrap()
         .values()
         .all(|s| s["request"].is_null()));
+}
+
+#[test]
+fn plain_switch_to_key_resumes_managed_conversations_and_attributes_only_new_spend() {
+    let f = interactive_fixture();
+    let mut add = f
+        .command()
+        .args(["add-key", "limit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(b"sk-ant-api03-fixture-private-ABCD\n")
+        .unwrap();
+    assert!(add.wait().unwrap().success());
+    let _one = start_interactive(&f, "a", false);
+    let _two = start_interactive(&f, "c", false);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().len() == 2
+            && controls(&f)
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|s| s["busy"] == false)
+    });
+    let before = controls(&f);
+    let root = before.as_object().unwrap().values().next().unwrap()["root"]
+        .as_str()
+        .unwrap();
+    let project = f.source.join("projects/test");
+    fs::create_dir_all(&project).unwrap();
+    let row = |timestamp: String, id: &str| {
+        json!({"timestamp": timestamp, "sessionId":root,"requestId":id,"message":{"id":id,"model":"claude-sonnet-4-5","usage":{"input_tokens":1000000}}}).to_string()
+    };
+    let old = row(
+        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+        "old",
+    );
+    let log = project.join(format!("{root}.jsonl"));
+    fs::write(&log, &old).unwrap();
+    let output = f
+        .command()
+        .args(["switch", "limit", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .matches("Queued")
+            .count(),
+        2
+    );
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|s| s["alias"] == "limit" && s["switching"] == false)
+    });
+    let after = controls(&f);
+    let registry = f.registry();
+    for (token, s) in after.as_object().unwrap() {
+        assert_eq!(s["root"], before[token]["root"]);
+        assert!(s["unsupported"].as_str().unwrap().contains("API key"));
+        let root = s["root"].as_str().unwrap();
+        assert_eq!(registry["bindings"][root]["alias"], "limit");
+        assert_eq!(registry["key_sessions"][root], "limit");
+    }
+    fs::write(
+        log,
+        format!("{}\n{}", old, row(chrono::Utc::now().to_rfc3339(), "new")),
+    )
+    .unwrap();
+    let usage = f.command().arg("usage").output().unwrap();
+    assert!(usage.status.success());
+    assert!(
+        String::from_utf8_lossy(&usage.stdout).contains("$3.00 7d  $3.00 30d"),
+        "{}",
+        String::from_utf8_lossy(&usage.stdout)
+    );
+    let retry = f
+        .command()
+        .args(["switch", "b", "--only", "limit"])
+        .output()
+        .unwrap();
+    assert!(!retry.status.success());
+    assert!(String::from_utf8_lossy(&retry.stderr).contains("API key conversations"));
+    let _subscription = start_interactive(&f, "a", false);
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["alias"] == "a" && s["busy"] == false)
+    });
+    let back = f.command().args(["switch", "b", "--yes"]).output().unwrap();
+    assert!(
+        back.status.success(),
+        "{}",
+        String::from_utf8_lossy(&back.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&back.stdout)
+            .matches("Queued")
+            .count(),
+        1
+    );
+    assert!(String::from_utf8_lossy(&back.stderr).contains("API key conversations"));
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["alias"] == "b" && s["switching"] == false)
+    });
+    let shared: Value =
+        serde_json::from_slice(&fs::read(f.source.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(shared["oauthAccount"]["emailAddress"], "b@x");
+    for bytes in [
+        &output.stdout,
+        &output.stderr,
+        &usage.stdout,
+        &usage.stderr,
+        &retry.stderr,
+        &fs::read(f.temp.path().join("supervisors.log")).unwrap(),
+    ] {
+        assert!(!String::from_utf8_lossy(bytes).contains("fixture-private"));
+    }
 }
 
 #[test]

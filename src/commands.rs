@@ -362,6 +362,8 @@ pub fn del(alias: &str) -> Result<()> {
     ps.accounts.remove(alias);
     crate::routing::store::Store::default_path()?.update(|s| {
         s.key_sessions.retain(|_, saved| saved != alias);
+        s.key_session_started_at_ms
+            .retain(|root, _| s.key_sessions.contains_key(root));
         Ok(())
     })?;
     if let Some(mut obs) = Observation::load()? {
