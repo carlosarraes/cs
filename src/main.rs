@@ -8,6 +8,7 @@ mod launch;
 mod login;
 mod native;
 mod policy;
+mod pricing;
 mod proxy;
 mod routing;
 mod session_control;
