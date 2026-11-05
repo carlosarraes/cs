@@ -43,13 +43,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Save an Anthropic API key from masked stdin, optionally with an org admin key
-    AddKey {
-        alias: String,
-        /// Also prompt for an organization admin key for usage reports
-        #[arg(long)]
-        admin: bool,
-    },
+    /// Save an Anthropic API key from masked stdin
+    AddKey { alias: String },
     /// Save an account under an alias, restoring the previously active login by default
     #[command(
         after_help = "By default, restore the previously selected login and preserve current/previous.
@@ -194,7 +189,7 @@ fn main() -> Result<()> {
         unreachable!("clap requires a command or --llm");
     };
     match command {
-        Commands::AddKey { alias, admin } => commands::add_key(&alias, admin),
+        Commands::AddKey { alias } => commands::add_key(&alias),
         Commands::Add {
             alias,
             current,

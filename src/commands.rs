@@ -106,7 +106,7 @@ fn record_switch(ps: &mut ProviderState, target: &str) {
     ps.current = Some(target.to_string());
 }
 
-pub fn add_key(alias: &str, admin: bool) -> Result<()> {
+pub fn add_key(alias: &str) -> Result<()> {
     validate_alias(alias)?;
     let _credentials = crate::accounts::credential_lock()?;
     let _lock = state::lock()?;
@@ -117,29 +117,14 @@ pub fn add_key(alias: &str, admin: bool) -> Result<()> {
         ));
     }
     let key = crate::login::read_secret("Anthropic API key: ")?;
-    crate::accounts::validate_key(&key, false)?;
-    let admin_key = if admin {
-        let secret = crate::login::read_secret("Organization admin key: ")?;
-        crate::accounts::validate_key(&secret, true)?;
-        Some(secret)
-    } else {
-        None
-    };
+    crate::accounts::validate_key(&key)?;
     let hint = crate::accounts::key_hint(&key);
-    crate::accounts::save_key(
-        alias,
-        &crate::accounts::KeySecrets {
-            key,
-            admin: admin_key,
-        },
-    )?;
+    crate::accounts::save_key(alias, &crate::accounts::KeySecrets { key })?;
     state.claude_mut().accounts.insert(
         alias.into(),
         Account {
             kind: Some(state::AccountKind::ApiKey {
                 key_hint: hint.clone(),
-                key_id: None,
-                admin_ref: admin.then(|| alias.into()),
             }),
             email: String::new(),
             data: serde_json::json!({}),

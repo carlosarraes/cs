@@ -22,13 +22,10 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.0.path().join("claude"));
         command
     }
-    fn add(&self, admin: bool) -> std::process::Output {
-        let mut command = self.command();
-        command.args(["add-key", "work-api"]);
-        if admin {
-            command.arg("--admin");
-        }
-        let mut child = command
+    fn add(&self) -> std::process::Output {
+        let mut child = self
+            .command()
+            .args(["add-key", "work-api"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -36,11 +33,6 @@ impl Fixture {
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         input.write_all(key().as_bytes()).unwrap();
-        if admin {
-            input
-                .write_all(format!("\n{}", admin_key()).as_bytes())
-                .unwrap();
-        }
         input.write_all(b"\n").unwrap();
         drop(input);
         child.wait_with_output().unwrap()
@@ -49,14 +41,11 @@ impl Fixture {
 fn key() -> String {
     ["sk-ant-api03-", "fixture-private-", "ABCD"].concat()
 }
-fn admin_key() -> String {
-    ["sk-ant-admin01-", "fixture-private-", "WXYZ"].concat()
-}
 
 #[test]
-fn add_list_delete_keep_both_secrets_out_of_output_state_and_config() {
+fn add_list_delete_keep_secrets_out_of_output_state_and_config() {
     let f = Fixture::new();
-    let output = f.add(true);
+    let output = f.add();
     assert!(
         output.status.success(),
         "{}",
@@ -70,7 +59,7 @@ fn add_list_delete_keep_both_secrets_out_of_output_state_and_config() {
     );
     let listed = f.command().arg("list").output().unwrap();
     assert!(String::from_utf8_lossy(&listed.stdout).contains("[key]"));
-    let duplicate = f.add(false);
+    let duplicate = f.add();
     assert!(!duplicate.status.success());
     for bytes in [
         &output.stdout,
@@ -83,7 +72,6 @@ fn add_list_delete_keep_both_secrets_out_of_output_state_and_config() {
     ] {
         let text = String::from_utf8_lossy(bytes);
         assert!(!text.contains(&key()));
-        assert!(!text.contains(&admin_key()));
         assert!(!text.contains("fixture-private"));
     }
     let secrets = f.0.path().join("data/cs/key-credentials.json");
@@ -111,7 +99,7 @@ fn add_list_delete_keep_both_secrets_out_of_output_state_and_config() {
 #[test]
 fn usage_estimates_only_assigned_sessions_and_obeys_cache_and_live_refresh() {
     let f = Fixture::new();
-    assert!(f.add(false).status.success());
+    assert!(f.add().status.success());
     let source = f.0.path().join("claude/projects/project");
     fs::create_dir_all(&source).unwrap();
     let log = |input: u64| {
@@ -140,8 +128,11 @@ fn usage_estimates_only_assigned_sessions_and_obeys_cache_and_live_refresh() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    assert!(String::from_utf8_lossy(&first.stdout).contains("$3.00 7d  $3.00 30d  (as of "));
-    assert!(String::from_utf8_lossy(&first.stdout).contains("est."));
+    let out = String::from_utf8_lossy(&first.stdout);
+    assert!(out.contains("work-api  [key …ABCD]  $3.00 7d  $3.00 30d  (as of "));
+    assert!(out.contains("est."));
+    assert!(out.contains("local  $"), "missing local total: {out}");
+    assert!(!out.contains("admin"), "{out}");
     assert_eq!(
         String::from_utf8_lossy(&first.stderr)
             .matches("unknown Claude model")
@@ -163,7 +154,7 @@ fn usage_estimates_only_assigned_sessions_and_obeys_cache_and_live_refresh() {
 #[test]
 fn explicit_key_launch_injects_only_child_and_persists_attribution() {
     let f = Fixture::new();
-    assert!(f.add(true).status.success());
+    assert!(f.add().status.success());
     let bin = f.0.path().join("bin");
     fs::create_dir(&bin).unwrap();
     fs::write(bin.join("claude"),r#"#!/bin/sh
@@ -212,7 +203,7 @@ printf 'KEY_CHILD_OK\n'
     assert!(registry["leases"].as_object().unwrap().is_empty());
     for bytes in [&output.stdout, &output.stderr] {
         let text = String::from_utf8_lossy(bytes);
-        assert!(!text.contains(&key()) && !text.contains(&admin_key()));
+        assert!(!text.contains(&key()));
     }
     fn scan(path: &std::path::Path) {
         for entry in fs::read_dir(path).unwrap() {
@@ -250,7 +241,7 @@ printf 'KEY_CHILD_OK\n'
 #[test]
 fn key_launch_rejects_unattributed_existing_conversations() {
     let f = Fixture::new();
-    assert!(f.add(false).status.success());
+    assert!(f.add().status.success());
     let root = "1b48e828-81df-469f-801f-4c268d29d8b2";
     let source = f.0.path().join("claude/projects/other-project");
     let bin = f.0.path().join("empty-bin");
@@ -271,7 +262,7 @@ fn key_launch_rejects_unattributed_existing_conversations() {
 #[test]
 fn interactive_resume_cannot_attribute_old_transcript_to_key() {
     let f = Fixture::new();
-    assert!(f.add(false).status.success());
+    assert!(f.add().status.success());
     let root = "1b48e828-81df-469f-801f-4c268d29d8b2";
     let source = f.0.path().join("claude/projects/old-project");
     fs::create_dir_all(&source).unwrap();

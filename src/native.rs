@@ -434,7 +434,7 @@ pub fn verify(profile: &Path, alias: &str, email: &str) -> Result<()> {
 
 pub fn key_command(profile: &Path, args: Vec<OsString>, alias: &str) -> Result<NativeCommand> {
     let secret = crate::accounts::read_key(alias)?;
-    crate::accounts::validate_key(&secret.key, false)?;
+    crate::accounts::validate_key(&secret.key)?;
     let mut command = command(profile, args)?;
     command.env("ANTHROPIC_API_KEY", secret.key);
     Ok(command)

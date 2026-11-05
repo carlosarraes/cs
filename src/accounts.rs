@@ -5,25 +5,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub struct KeySecrets {
     pub key: String,
-    pub admin: Option<String>,
 }
 
-pub fn validate_key(key: &str, admin: bool) -> Result<()> {
+pub fn validate_key(key: &str) -> Result<()> {
     let valid = key.len() > 20
         && key.len() <= 512
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        && if admin {
-            key.starts_with("sk-ant-admin")
-        } else {
-            key.starts_with("sk-ant-") && !key.starts_with("sk-ant-admin")
-        };
-    anyhow::ensure!(
-        valid,
-        "invalid Anthropic {}key",
-        if admin { "admin " } else { "API " }
-    );
+        && key.starts_with("sk-ant-")
+        && !key.starts_with("sk-ant-admin");
+    anyhow::ensure!(valid, "invalid Anthropic API key");
     Ok(())
 }
 
@@ -61,7 +53,6 @@ pub fn save_key(alias: &str, secret: &KeySecrets) -> Result<()> {
         alias.into(),
         KeySecrets {
             key: secret.key.clone(),
-            admin: secret.admin.clone(),
         },
     );
     crate::util::atomic_write(&key_credentials_path()?, &serde_json::to_vec(&saved)?)

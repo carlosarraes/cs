@@ -29,13 +29,7 @@ pub struct Account {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AccountKind {
     Subscription,
-    ApiKey {
-        key_hint: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        key_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        admin_ref: Option<String>,
-    },
+    ApiKey { key_hint: String },
 }
 
 impl Account {
@@ -278,13 +272,14 @@ mod tests {
     #[test]
     fn key_metadata_round_trips_without_credentials() {
         let account: Account = serde_json::from_value(json!({
-            "kind":{"type":"api_key","key_hint":"sk-ant-…ABCD","key_id":"apikey_123"}
+            "kind":{"type":"api_key","key_hint":"sk-ant-…ABCD"}
         }))
         .unwrap();
         assert!(account.is_key());
         assert_eq!(account.key_hint(), Some("sk-ant-…ABCD"));
         let back = serde_json::to_value(&account).unwrap();
-        assert_eq!(back["kind"]["key_id"], "apikey_123");
+        assert_eq!(back["kind"]["key_hint"], "sk-ant-…ABCD");
+        assert!(back["kind"].get("key_id").is_none());
         assert!(back["kind"].get("admin_ref").is_none());
     }
 }

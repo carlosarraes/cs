@@ -55,7 +55,6 @@ cs add work              # log in, save "work", restore the previously selected 
 cs add main --current    # save the live login, then restore the selected account
 cs add work --switch     # log in, save "work", and make it active
 cs add-key work-api      # prompt for an Anthropic API key, with masked input
-cs add-key org-api --admin # also prompt for an organization admin key
 cs switch work           # switch to "work"
 cs switch -              # switch back to the previous account (toggles)
 cs list                  # list saved accounts (* = current, - = previous)
@@ -72,7 +71,7 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 | Command | Description |
 |---|---|
 | `cs add <alias> [--current] [--force] [--switch]` | Save an account; restore the selected login unless `--switch` is set |
-| `cs add-key <alias> [--admin]` | Read an Anthropic API key from masked stdin; optionally save an org admin key |
+| `cs add-key <alias>` | Read an Anthropic API key from masked stdin |
 | `cs switch <alias>` / `cs switch -` | Activate an alias; `-` is the previous one |
 | `cs del <alias>` | Remove a saved alias (live credentials untouched) |
 | `cs list` | List saved aliases |
@@ -123,67 +122,54 @@ percentage and reset countdown share its color. Piped output stays plain;
 ## Anthropic API-key spend
 
 ```sh
-cs add-key work-api            # paste the API key at the masked prompt
-cs add-key org-api --admin     # paste the API key, then its org admin key
+cs add-key work-api            # paste an Anthropic API key (masked stdin)
 cs run --account work-api -- -p "say hi"
 cs usage
 cs usage --live
-cs del work-api                # removes the API key and its admin key
+cs del work-api                # removes the API key secret
 ```
 
-Keys are read from stdin, never command arguments. Use separate lines when piping
-an API key and admin key. `cs list` marks these aliases `[key]` and shows only
-`sk-ant-…ABCD`, the last four characters. Keys live in macOS Keychain or in
-`$XDG_DATA_HOME/cs/key-credentials.json` on Linux, defaulting to
-`~/.local/share/cs/key-credentials.json`, with mode 0600. State and config contain
-only a redacted hint, an optional API key id, and an admin-credential reference.
-Delete and re-add an alias to replace its keys or add an admin key.
+Keys are read from stdin, never command arguments. `cs list` marks these aliases
+`[key]` and shows only `sk-ant-…ABCD`, the last four characters. Keys live in
+macOS Keychain or in `$XDG_DATA_HOME/cs/key-credentials.json` on Linux (default
+`~/.local/share/cs/key-credentials.json`), mode 0600. State and config contain
+only a redacted hint. Delete and re-add an alias to replace its key.
 
 API-key aliases require `cs run --account ALIAS`. The selected API key is injected
-as `ANTHROPIC_API_KEY` into that child process. Admin keys are never injected.
-Key accounts do not participate in automatic routing, `cs switch next`, shared
-login switching, or the proxy. Their conversations cannot change accounts while
-running. An existing conversation without attribution to that key must start a
-new conversation, so old subscription or other-key usage is not charged to it.
+as `ANTHROPIC_API_KEY` into that child process only. Key accounts do not participate
+in automatic routing, `cs switch next`, shared login switching, or the proxy.
 
-`cs usage` prints one spend row per key, without quota percentages:
+`cs usage` prints one estimated spend row per key, plus a `local` total for every
+Claude Code session on this machine (any account). Figures are token×price estimates
+from local JSONL logs (same approach as ccost/ccusage), not Anthropic invoices:
 
 ```text
 work-api  [key …ABCD]  $12.40 7d  $48.10 30d  (as of 21:40) est.
-org-api  [key …WXYZ]  $15.20 7d  $61.80 30d  (as of 21:40) admin usage_report
+local  $40.00 7d  $120.00 30d  (as of 21:40) est.
 ```
 
-With an admin key, cs resolves the API key id from its partial hint, caches the
-id, then reads Anthropic's daily, per-model `usage_report/messages` buckets for
-that key, following all pages. Ambiguous hints produce `spend unknown` rather
-than selecting a key arbitrarily. **Admin keys grant organization-wide access.**
-cs uses them read-only, through GET requests for API-key metadata and usage.
-Use an admin key from the same organization as the API key.
+Claude Code JSONL does not record which API key a request used. Per-alias lines
+therefore count only session ids cs recorded when launching that key, including
+subagent directories. Sessions started outside cs are not attributed to a key, but
+still appear in the `local` total. Attribution survives closed sessions and router
+restarts; deleting an alias removes its attribution and cached spend. Using another
+login or key outside cs within an attributed conversation makes that alias estimate
+unreliable.
 
-Without an admin key, `est.` means a local token-price estimate. Claude Code JSONL
-does not identify the API key used for a request. cs therefore counts only session
-ids it recorded for that key when launching Claude, including attributed logs in
-subagent directories. Sessions started outside cs are not counted. Attribution
-survives closed sessions and router restarts; deleting an alias removes its
-attribution and cached spend. Using another login or key outside cs within an
-attributed conversation makes its estimate unreliable.
-
-Both sources apply standard model token prices to uncached input, output,
-five-minute cache writes, one-hour cache writes, and cache reads. They sum buckets
-since midnight UTC 7 and 30 days ago, through now; the current day is partial.
-The displayed `as of` time uses your local timezone. Admin reports can lag and
-these totals are token-based approximations, not invoices: discounts, batch or
-premium-tier adjustments, tools and other non-token charges are not included.
-Local estimates deduplicate message id plus request id and prefer parent records
-over sidechain replays. Unknown models use Sonnet fallback prices, with one warning
-per invocation. A static Claude price table works offline. Optional LiteLLM pricing
-uses `model_prices_and_context_window.json`, cached for 24 hours under cs's cache
+Estimates apply standard model token prices to uncached input, output, five-minute
+cache writes, one-hour cache writes, and cache reads. They sum midnight-UTC windows
+for the last 7 and 30 days through now; the current day is partial. The displayed
+`as of` time uses your local timezone. Totals omit discounts, batch or premium-tier
+adjustments, tools, and other non-token charges. Local estimates deduplicate message
+id plus request id and prefer parent records over sidechain replays. Unknown models
+use Sonnet fallback prices, with one warning per invocation. A static Claude price
+table works offline. Optional LiteLLM pricing uses
+`model_prices_and_context_window.json`, cached for 24 hours under cs's cache
 directory, with a three-second fetch timeout and cached/static fallback.
 
 Spend refreshes at most once per `[spend] poll_secs`, default 3600, when the daemon
-polls or `cs usage` runs. `--live` forces a refresh but still honors HTTP 429
-backoff. Unavailable readings show `spend unknown: REASON`. A rate limit retains
-the last successful spend and its original `as of` time until retry is allowed.
+polls or `cs usage` runs. `--live` forces a refresh. Unavailable readings show
+`spend unknown: REASON`.
 
 ## Session routing
 

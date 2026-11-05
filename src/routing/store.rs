@@ -349,8 +349,6 @@ mod tests {
         saved.claude_mut().accounts.get_mut("a").unwrap().kind =
             Some(crate::state::AccountKind::ApiKey {
                 key_hint: "sk-ant-…ABCD".into(),
-                key_id: None,
-                admin_ref: None,
             });
         assert!(!token_valid(&saved.claude().accounts["a"], now()));
         let token = store.register().unwrap();
