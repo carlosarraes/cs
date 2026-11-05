@@ -107,7 +107,7 @@ for pending moves or failures. Without a target, switch changes the shared login
     Whoami,
     /// Update a saved alias with the live credentials (after a `/login` outside cs)
     Refresh,
-    /// Show account session counts and cached 5h/7d usage; --live fetches now
+    /// Show subscription quotas and API-key 7d/30d spend; --live fetches now
     Usage {
         /// Poll the API right now instead of reading the router's last observation
         #[arg(long)]
@@ -174,7 +174,18 @@ enum DaemonCommands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        if std::env::args_os()
+            .skip(1)
+            .any(|arg| arg.to_string_lossy().contains("sk-ant-"))
+        {
+            eprintln!(
+                "error: enter API keys only at the masked add-key prompt, never as arguments"
+            );
+            std::process::exit(2);
+        }
+        error.exit()
+    });
     if cli.llm {
         print!("{}", include_str!("llm.md"));
         return Ok(());

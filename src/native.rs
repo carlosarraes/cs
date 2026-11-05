@@ -76,7 +76,10 @@ fn prepare_files(
         .create(profile)?;
     fs::set_permissions(profile, fs::Permissions::from_mode(0o700))?;
     let mut config = read_json(&profile.join(".claude.json"))?;
-    if let Some(email) = config["oauthAccount"]["emailAddress"].as_str() {
+    if let Some(email) = config["oauthAccount"]["emailAddress"]
+        .as_str()
+        .filter(|_| !account.is_key())
+    {
         if email != account.email {
             bail!(
                 "saved profile identity differs from account {}; refusing to replace it",
@@ -102,14 +105,21 @@ fn prepare_files(
             config[key] = value.clone();
         }
     }
-    let identity = account
-        .data
-        .get("oauthAccount")
-        .context("saved account is missing its native login identity")?;
-    if identity["emailAddress"].as_str() != Some(&account.email) {
-        bail!("saved native identity does not match {}", account.email);
+    if account.is_key() {
+        config
+            .as_object_mut()
+            .context("invalid native profile config")?
+            .remove("oauthAccount");
+    } else {
+        let identity = account
+            .data
+            .get("oauthAccount")
+            .context("saved account is missing its native login identity")?;
+        if identity["emailAddress"].as_str() != Some(&account.email) {
+            bail!("saved native identity does not match {}", account.email);
+        }
+        config["oauthAccount"] = identity.clone();
     }
-    config["oauthAccount"] = identity.clone();
     util::atomic_write(&profile.join(".claude.json"), &serde_json::to_vec(&config)?)?;
     let mut settings = read_json(&source.join("settings.json"))?;
     require_hooks(&settings)?;
@@ -165,6 +175,9 @@ pub fn maintain() -> Result<()> {
     let _ = crate::commands::refresh_current_if_stale();
     let accounts = state::State::load()?;
     for (alias, account) in &accounts.claude().accounts {
+        if account.is_key() {
+            continue;
+        }
         if let Err(error) = crate::commands::renew_native_account(alias, &account.email) {
             eprintln!("cs: {alias}: credential renewal unavailable: {error}");
         }
@@ -205,6 +218,9 @@ pub fn sync_all() -> Result<()> {
     let _credentials = crate::accounts::credential_lock()?;
     let accounts = state::State::load()?;
     for (alias, account) in &accounts.claude().accounts {
+        if account.is_key() {
+            continue;
+        }
         let profile = profile_path(alias)?;
         if !profile.exists() {
             continue;
@@ -243,7 +259,14 @@ pub fn prepare(alias: &str, account: &state::Account, source: &Path) -> Result<P
         source.join(".claude.json")
     };
     prepare_files(&profile, source, &read_json(&source_global)?, account)?;
-    sync_credentials(&profile, &account.data["claudeAiOauth"])?;
+    if account.is_key() {
+        let path = profile.join(".credentials.json");
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    } else {
+        sync_credentials(&profile, &account.data["claudeAiOauth"])?;
+    }
     Ok(profile)
 }
 
@@ -405,6 +428,30 @@ pub fn verify(profile: &Path, alias: &str, email: &str) -> Result<()> {
         || status["apiProvider"] != "firstParty"
     {
         bail!("{alias}: Claude did not confirm the expected native claude.ai login; no fallback");
+    }
+    Ok(())
+}
+
+pub fn key_command(profile: &Path, args: Vec<OsString>, alias: &str) -> Result<NativeCommand> {
+    let secret = crate::accounts::read_key(alias)?;
+    crate::accounts::validate_key(&secret.key, false)?;
+    let mut command = command(profile, args)?;
+    command.env("ANTHROPIC_API_KEY", secret.key);
+    Ok(command)
+}
+
+pub fn verify_key(profile: &Path, alias: &str) -> Result<()> {
+    let output = key_command(profile, Vec::new(), alias)?
+        .args(["auth", "status", "--json"])
+        .output()
+        .context("checking API key authentication")?;
+    let status: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("Claude auth status did not return valid JSON"))?;
+    if !output.status.success()
+        || status["authMethod"] != "api_key"
+        || status["apiProvider"] != "firstParty"
+    {
+        bail!("{alias}: Claude did not confirm API key authentication; no fallback");
     }
     Ok(())
 }

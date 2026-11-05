@@ -2,6 +2,60 @@
 use std::process::Command;
 
 #[test]
+fn add_key_masks_both_prompts_filters_escape_sequences_and_restores_terminal() {
+    let result = Command::new("python3").arg("-c").arg(r#"
+import os, pathlib, pty, select, signal, subprocess, sys, tempfile, termios, time
+binary = sys.argv[1]
+for mode in ('paste', 'cancel', 'admin-cancel', 'signal'):
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        master, slave = pty.openpty()
+        before = termios.tcgetattr(slave)
+        env = dict(os.environ, HOME=directory, XDG_DATA_HOME=str(root / 'data'), XDG_CONFIG_HOME=str(root / 'config'))
+        process = subprocess.Popen([binary, 'add-key', 'api', '--admin'], env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        transcript = b''
+        key = b'sk-ant-api03-' + b'private-test-' + b'ABCD'
+        admin = b'sk-ant-admin01-' + b'private-test-' + b'WXYZ'
+        sent = 0
+        deadline = time.monotonic() + 5
+        try:
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .02)[0]: transcript += os.read(master, 4096)
+                if b'Anthropic API key: ' in transcript and sent == 0:
+                    sent = 1
+                    if mode == 'signal': process.send_signal(signal.SIGTERM)
+                    elif mode == 'cancel': os.write(master, b'\x1b[\x03')
+                    else: os.write(master, b'\x1b[200~' + key[:-1] + b'Q\x7fD\x1b[201~\x1b[A\r')
+                if b'Organization admin key: ' in transcript and sent == 1:
+                    sent = 2
+                    os.write(master, b'\x03' if mode == 'admin-cancel' else admin + b'\r')
+                if process.poll() is not None:
+                    while select.select([master], [], [], 0)[0]: transcript += os.read(master, 4096)
+                    break
+            assert process.poll() is not None, 'key prompt timed out'
+            assert termios.tcgetattr(slave) == before, 'terminal was not restored'
+            assert key not in transcript and admin not in transcript and b'private-test' not in transcript, 'key input leaked'
+            state = root / 'data/cs/state.json'
+            if mode == 'paste':
+                assert process.returncode == 0, transcript
+                assert b'sk-ant-' not in state.read_bytes() or b'sk-ant-\xe2\x80\xa6ABCD' in state.read_bytes()
+                assert transcript.count(b'*') == len(key) + len(admin) + 1, 'incorrect masking'
+            else:
+                assert process.returncode != 0, 'cancelled key accepted'
+                assert not state.exists(), 'cancelled key saved'
+                assert not (root / 'data/cs/key-credentials.json').exists(), 'cancelled secret saved'
+        finally:
+            if process.poll() is None: process.kill(); process.wait()
+            os.close(master); os.close(slave)
+"#).arg(env!("CARGO_BIN_EXE_cs")).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn login_pty_masks_paste_and_restores_terminal() {
     let result = Command::new("python3")
         .arg("-c")

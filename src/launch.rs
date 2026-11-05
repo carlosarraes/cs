@@ -42,9 +42,31 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
     let forced = requested
         .map(|name| resolve_account(&accounts, name).map(|(alias, _)| alias.to_string()))
         .transpose()?;
+    if forced.is_none()
+        && accounts
+            .claude()
+            .accounts
+            .values()
+            .all(state::Account::is_key)
+    {
+        bail!("no subscription accounts for automatic routing; use cs run --account <key-alias>");
+    }
+    if let Some(alias) = forced
+        .as_ref()
+        .filter(|alias| accounts.claude().accounts[*alias].is_key())
+    {
+        let known = Store::default_path()?
+            .update(|s| Ok(s.key_sessions.get(&root).is_some_and(|a| a == alias)))?;
+        if !known && crate::conversation::has_log(&root, &source)? {
+            bail!("conversation has no attribution to this key; start a new conversation with cs run --account {alias}");
+        }
+    }
     let cfg = crate::config::load()?.routing;
     let mut observation = crate::usage::Observation::load()?.unwrap_or_default();
-    if let Some(alias) = &forced {
+    if let Some(alias) = forced
+        .as_ref()
+        .filter(|alias| !accounts.claude().accounts[*alias].is_key())
+    {
         let account = &accounts.claude().accounts[alias];
         if !crate::routing::store::token_valid(account, crate::usage::now()) {
             bail!("{alias}: token expired or unavailable; refresh this account; no fallback");
@@ -67,28 +89,29 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
             alias.clone(),
             crate::usage::Entry::new(crate::usage::Reading::Known(usage), crate::usage::now()),
         );
-    } else if crate::routing::policy::select(
-        &observation
-            .accounts
-            .iter()
-            .filter(|(alias, _)| {
-                accounts
-                    .claude()
-                    .accounts
-                    .get(*alias)
-                    .is_some_and(|account| {
-                        crate::routing::store::token_valid(account, crate::usage::now())
-                    })
-            })
-            .map(|(alias, entry)| (alias.clone(), entry.clone()))
-            .collect(),
-        &Default::default(),
-        crate::usage::now(),
-        cfg.five_hour_ceiling,
-        cfg.weekly_ceiling,
-        cfg.max_usage_age_secs as i64,
-    )
-    .is_none()
+    } else if forced.is_none()
+        && crate::routing::policy::select(
+            &observation
+                .accounts
+                .iter()
+                .filter(|(alias, _)| {
+                    accounts
+                        .claude()
+                        .accounts
+                        .get(*alias)
+                        .is_some_and(|account| {
+                            crate::routing::store::token_valid(account, crate::usage::now())
+                        })
+                })
+                .map(|(alias, entry)| (alias.clone(), entry.clone()))
+                .collect(),
+            &Default::default(),
+            crate::usage::now(),
+            cfg.five_hour_ceiling,
+            cfg.weekly_ceiling,
+            cfg.max_usage_age_secs as i64,
+        )
+        .is_none()
     {
         crate::accounts::poll()?;
         accounts = state::State::load()?;
@@ -106,11 +129,18 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
             &cfg,
         )?;
         let profile = crate::native::prepare(&alias, &account, &source)?;
-        crate::native::verify(&profile, &alias, &account.email)?;
-        let mut command = crate::native::command(&profile, args.clone())?;
+        let mut command = if account.is_key() {
+            crate::native::verify_key(&profile, &alias)?;
+            crate::native::key_command(&profile, args.clone(), &alias)?
+        } else {
+            crate::native::verify(&profile, &alias, &account.email)?;
+            crate::native::command(&profile, args.clone())?
+        };
         command.env("CS_NATIVE_LEASE", &token);
         use std::io::IsTerminal;
-        let unsupported = if !std::io::stdin().is_terminal() {
+        let unsupported = if account.is_key() {
+            Some("API key conversations cannot change accounts; start a new conversation".into())
+        } else if !std::io::stdin().is_terminal() {
             Some("headless sessions cannot be switched while running".into())
         } else {
             crate::session_control::resume_args(&args, &root)
@@ -139,10 +169,17 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
             );
             Ok(())
         })?;
-        eprintln!(
-            "cs: {root} -> {alias} ({}) — native claude.ai login",
-            account.email
-        );
+        if account.is_key() {
+            eprintln!(
+                "cs: {root} -> {alias} [key] {}",
+                account.key_hint().unwrap_or("sk-ant-…????")
+            );
+        } else {
+            eprintln!(
+                "cs: {root} -> {alias} ({}) — native claude.ai login",
+                account.email
+            );
+        }
         let status = supervise(
             command,
             &store,
@@ -151,6 +188,7 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
             &account.email,
             &args,
             &source,
+            !account.is_key(),
         )?;
         if !status.success() {
             let actual_alias = Controls::default_path()?
@@ -182,6 +220,20 @@ fn run_utility(args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
         .or(saved.claude().current.as_deref())
         .context("no selected account; use cs run --account <alias> -- <command>")?;
     let (alias, account) = resolve_account(&saved, name)?;
+    if account.is_key() {
+        let source = crate::native::source_config()?;
+        let profile = crate::native::prepare(alias, account, &source)?;
+        let status = crate::native::key_command(&profile, Vec::new(), alias)?
+            .args(args)
+            .env_remove("CS_NATIVE_LEASE")
+            .env_remove("CS_NATIVE_GENERATION")
+            .status()
+            .context("launching Claude utility command")?;
+        if !status.success() {
+            bail!("{alias}: Claude exited with {status}; no fallback");
+        }
+        return Ok(());
+    }
     crate::commands::renew_native_account(alias, &account.email)
         .with_context(|| format!("{alias}: credentials unavailable; no fallback"))?;
     let updated = state::State::load()?;
@@ -366,6 +418,7 @@ fn supervise(
     email: &str,
     args: &[OsString],
     source: &std::path::Path,
+    renew_credentials: bool,
 ) -> Result<std::process::ExitStatus> {
     use std::{
         io::IsTerminal,
@@ -480,7 +533,7 @@ fn supervise(
             if let Some(task) = renewal.as_mut() {
                 if task.try_wait()?.is_some() { renewal = None; }
             }
-            if last_sync.elapsed() >= Duration::from_secs(30) && renewal.is_none() && stopping.is_none() && moving.is_none() {
+            if renew_credentials && last_sync.elapsed() >= Duration::from_secs(30) && renewal.is_none() && stopping.is_none() && moving.is_none() {
                 use std::os::unix::process::CommandExt;
                 // Finish persisting a rotating grant even if the conversation exits meanwhile.
                 renewal = Some(std::process::Command::new(std::env::current_exe()?)

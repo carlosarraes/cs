@@ -115,8 +115,18 @@ impl Store {
                     .context("no account has fresh usage and quota headroom; run cs usage --live")?.to_string()
             };
             let account=accounts.claude().accounts.get(&alias).context("unknown selected account")?.clone();
-            if !token_valid(&account,now()){bail!("{alias}: token expired or unavailable; no fallback");}
-            if quota_exhausted(entries.get(&alias)){bail!("{alias}: quota exhausted; no fallback");}
+            if account.is_key() {
+                if forced.is_none() { bail!("API key accounts require an explicit --account"); }
+                if s.key_sessions.get(root).is_some_and(|previous|previous!=&alias)
+                    || s.bindings.get(root).is_some_and(|previous|previous.alias!=alias) {
+                    bail!("conversation belongs to a different account; start a new conversation for this key");
+                }
+                s.key_sessions.insert(root.into(),alias.clone());
+            } else {
+                if s.key_sessions.contains_key(root) { bail!("conversation was launched with an API key; start a new subscription conversation"); }
+                if !token_valid(&account,now()){bail!("{alias}: token expired or unavailable; no fallback");}
+                if quota_exhausted(entries.get(&alias)){bail!("{alias}: quota exhausted; no fallback");}
+            }
             let last_request=s.bindings.get(root).filter(|b|b.alias==alias && b.email==account.email).map_or(0,|b|b.last_request);
             s.bindings.insert(root.into(),Binding{alias:alias.clone(),email:account.email.clone(),last_request,in_flight:0});
             s.leases.get_mut(token).unwrap().root=Some(root.into());
@@ -137,6 +147,19 @@ impl Store {
                 .cloned()
                 .context("missing native assignment")?;
             if previous != root {
+                if let Some(alias) = s.key_sessions.get(&previous).cloned() {
+                    if !s.key_sessions.contains_key(root)
+                        && crate::conversation::has_usage(root,&crate::native::source_config()?)? {
+                        bail!("conversation has no attribution to this key; start a new conversation");
+                    }
+                    if s.key_sessions.get(root).is_some_and(|other|other!=&alias)
+                        || s.bindings.get(root).is_some_and(|other|other.alias!=alias) {
+                        bail!("conversation belongs to a different account; start a new conversation for this key");
+                    }
+                    s.key_sessions.insert(root.into(),alias);
+                } else if s.key_sessions.contains_key(root) {
+                    bail!("conversation was launched with an API key; start a new subscription conversation");
+                }
                 if s.retained(root,time,AFFINITY_SECS).is_some_and(|target|target.alias!=binding.alias || target.email!=binding.email) {
                     bail!("this conversation is assigned to another account; exit and resume it with cs run -- --resume {root}");
                 }
@@ -286,6 +309,9 @@ fn quota_exhausted(entry: Option<&Entry>) -> bool {
 }
 
 pub fn token_valid(account: &Account, time: i64) -> bool {
+    if account.is_key() {
+        return false;
+    }
     let o = &account.data["claudeAiOauth"];
     o["accessToken"].as_str().is_some_and(|s| !s.is_empty())
         && o["expiresAt"]
@@ -311,6 +337,83 @@ impl Drop for RequestGuard {
 mod tests {
     use super::*;
     use crate::usage::{Reading, Usage, Window};
+
+    #[test]
+    fn keys_are_explicit_native_only_even_with_stale_oauth_cache_or_proxy_binding() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: d.path().join("routing.json"),
+        };
+        let mut saved = accounts();
+        saved.claude_mut().accounts.retain(|a, _| a == "a");
+        saved.claude_mut().accounts.get_mut("a").unwrap().kind =
+            Some(crate::state::AccountKind::ApiKey {
+                key_hint: "sk-ant-…ABCD".into(),
+                key_id: None,
+                admin_ref: None,
+            });
+        assert!(!token_valid(&saved.claude().accounts["a"], now()));
+        let token = store.register().unwrap();
+        assert!(store
+            .reserve_native(
+                &token,
+                "automatic",
+                None,
+                &saved,
+                &entries(),
+                &Routing::default()
+            )
+            .is_err());
+        assert!(store
+            .reserve_native(
+                &token,
+                "root",
+                Some("a"),
+                &saved,
+                &entries(),
+                &Routing::default()
+            )
+            .is_ok());
+        assert!(store
+            .acquire_inner(
+                &token,
+                "root",
+                &saved,
+                &entries(),
+                &Routing::default(),
+                now(),
+                false
+            )
+            .is_err());
+        store
+            .native_event(&token, "new-root", "SessionStart", now())
+            .unwrap();
+        store.unregister(&token).unwrap();
+        store
+            .update(|s| {
+                s.bindings.clear();
+                assert_eq!(s.key_sessions.get("root").map(String::as_str), Some("a"));
+                assert_eq!(
+                    s.key_sessions.get("new-root").map(String::as_str),
+                    Some("a")
+                );
+                Ok(())
+            })
+            .unwrap();
+        let token = store.register().unwrap();
+        let mut changed = saved;
+        changed.claude_mut().accounts.get_mut("a").unwrap().kind = None;
+        assert!(store
+            .reserve_native(
+                &token,
+                "root",
+                Some("a"),
+                &changed,
+                &entries(),
+                &Routing::default()
+            )
+            .is_err());
+    }
     fn accounts() -> State {
         let mut s = State::default();
         for alias in ["a", "b"] {

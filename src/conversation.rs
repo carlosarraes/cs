@@ -75,6 +75,49 @@ pub fn ensure_not_running(root: &str, source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn log_paths(root: &str, source: &Path) -> Result<Vec<std::path::PathBuf>> {
+    if Path::new(root).file_name().and_then(|s| s.to_str()) != Some(root) {
+        bail!("invalid conversation id");
+    }
+    let entries = match fs::read_dir(source.join("projects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join(format!("{root}.jsonl"));
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => paths.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(paths)
+}
+
+pub fn has_log(root: &str, source: &Path) -> Result<bool> {
+    Ok(!log_paths(root, source)?.is_empty())
+}
+
+pub fn has_usage(root: &str, source: &Path) -> Result<bool> {
+    for path in log_paths(root, source)? {
+        let file = fs::File::open(path)?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.contains("\"usage\"") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn resolve(args: &mut Vec<OsString>, source: &Path, cwd: &Path) -> Result<String> {
     let mut selector = None;
     let mut explicit = None;
@@ -194,6 +237,26 @@ pub fn resolve(args: &mut Vec<OsString>, source: &Path, cwd: &Path) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribution_guard_ignores_metadata_files_and_fresh_session_headers() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("projects/project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(d.path().join("projects/.DS_Store"), "metadata").unwrap();
+        fs::write(
+            project.join("fresh.jsonl"),
+            r#"{"type":"system","subtype":"session_start"}"#,
+        )
+        .unwrap();
+        assert!(!has_usage("fresh", d.path()).unwrap());
+        fs::write(
+            project.join("old.jsonl"),
+            r#"{"message":{"usage":{"input_tokens":1}}}"#,
+        )
+        .unwrap();
+        assert!(has_usage("old", d.path()).unwrap());
+    }
     #[test]
     fn continuing_and_forking_preserve_history_but_allocate_the_right_root() {
         let d = tempfile::tempdir().unwrap();
