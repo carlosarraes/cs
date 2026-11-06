@@ -202,6 +202,8 @@ content, project settings, and ordinary Claude flags, including named resume:
 cs run -- --dangerously-skip-permissions --chrome --resume "pm"
 ```
 
+Duplicate or unmatched resume names open a picker like plain Claude; headless runs need a UUID for these names.
+
 Non-model utility commands can run even when the account has exhausted its model
 quota: `cs run --account carlos -- mcp list`. This applies to `mcp`, `doctor`,
 `auth status`, and standalone `--help`/`-h` or `--version`/`-v`. They use the pinned

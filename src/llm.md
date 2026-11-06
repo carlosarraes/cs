@@ -21,6 +21,8 @@ cs run --account user@example.com -- claude -p "say hi"
 Put cs options before -- and Claude options after it. The optional "claude"
 prefix is accepted. Permission bypass is optional and is passed through to Claude.
 
+Duplicate or unmatched resume names open a picker like plain Claude; headless runs need a UUID for these names.
+
 Automatic routing balances eligible accounts. A recent conversation's account
 is preferred within the one-hour affinity window. An exhausted account is skipped,
 including on resume. Existing processes do not switch accounts automatically.
