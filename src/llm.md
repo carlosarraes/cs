@@ -82,9 +82,10 @@ one UUID from cs sessions. Selectors leave shared login unchanged.
 Run cs sessions in another terminal; finding a UUID does not require a restart.
 --only/--from and --session are mutually exclusive.
 
-Without --interrupt, the move queues until Claude reports idle, typically about
-60 seconds after its response with no background agents. Then cs restarts Claude
-on DEST and resumes the same conversation with supported original flags.
+Without --interrupt, the move queues until Claude reports idle with no background
+agents. Idle sessions switch immediately; cs start is not needed for switching.
+Then cs restarts Claude on DEST and resumes the same conversation with supported
+original flags.
 --interrupt deliberately interrupts selected sessions and restarts immediately.
 Use it when Claude is waiting for a quota reset, which does not emit idle.
 

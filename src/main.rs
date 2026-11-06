@@ -71,9 +71,10 @@ Interactive login masks input with *; press Enter after pasting."
 Targeted: cs switch DEST --only ALIAS (also --from ALIAS)
           cs switch DEST --session UUID [--interrupt]
 Get UUIDs with cs sessions in another terminal; no restart needed.
-Without --interrupt, queue a restart after Claude's idle notification, typically
-about 60 seconds after its response with no background agents. Use --interrupt
-for sessions waiting for a quota reset. A restart resumes the same conversation.
+Without --interrupt, restart when Claude reports idle with no background agents.
+Idle sessions switch immediately; cs start is not needed for switching.
+Use --interrupt for sessions waiting for a quota reset.
+A restart resumes the same conversation.
 Only updated cs run launchers support targeted switching. Check cs sessions
 for pending moves or failures. Plain switch changes shared login and queues all
 supported managed conversations not already on DEST; unsupported ones are reported.

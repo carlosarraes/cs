@@ -278,7 +278,7 @@ fn interactive_fixture() -> Fixture {
     fs::write(state_path, state.to_string()).unwrap();
     fs::write(usage_path, usage.to_string()).unwrap();
     fs::write(f.bin.join("claude"), r#"#!/usr/bin/env python3
-import json,os,sys,pathlib,time,subprocess
+import json,os,sys,pathlib,time,subprocess,signal
 profile=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
 key=os.environ.get('ANTHROPIC_API_KEY','')
 assert not os.environ.get('ANTHROPIC_AUTH_TOKEN') and not os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') and not os.environ.get('ANTHROPIC_BASE_URL')
@@ -304,13 +304,30 @@ def event(name,agent=None,notification=None):
 if email=='a@x' and (test/'change-directory').exists():os.chdir(test/'frontend')
 assert not event('SessionStart')
 busy=os.environ.get('TEST_BUSY')=='yes' and email=='a@x'
-if not busy:event('Notification',notification='idle_prompt')
+structural=(test/'structural-status').exists()
+def record(status):
+ start=pathlib.Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+ value={'pid':os.getpid(),'procStart':start,'sessionId':root,'version':'2.1.319','status':status,'statusUpdatedAt':int(time.time()*1000)}
+ if (test/'legacy-status').exists():
+  value.pop('status');value.pop('statusUpdatedAt');value['version']='2.0.0'
+ path=profile/'sessions'/f'{os.getpid()}.json'
+ pending=path.with_suffix('.tmp')
+ pending.write_text(json.dumps(value));pending.replace(path)
+def terminate(signum,frame):
+ with (test/'terminated.jsonl').open('a') as out:out.write(json.dumps({'pid':os.getpid(),'email':email})+'\n')
+ sys.exit(0)
+if structural:signal.signal(signal.SIGTERM,terminate)
+if not busy and not structural:event('Notification',notification='idle_prompt')
 if busy:
  assert not event('UserPromptSubmit')
- event('SubagentStart','background-agent')
+ if not structural:event('SubagentStart','background-agent')
+if structural:record('busy' if busy else 'idle')
 while True:
+ if busy and structural and (test/'probe-busy').exists():
+  (test/'busy-observed').touch()
  if busy and (test/'finish-response').exists():
   event('Stop');busy=False
+  if structural:record('idle')
   (test/('stopped-'+root)).touch()
  if (test/'finish-agent').exists():
   event('SubagentStop','background-agent')
@@ -342,19 +359,23 @@ fn start_interactive(f: &Fixture, account: &str, busy: bool) -> Interactive {
         .append(true)
         .open(f.temp.path().join("supervisors.log"))
         .unwrap();
-    let child = f
-        .command()
-        .args([
-            "run",
-            "--account",
-            account,
-            "--",
-            "--chrome",
-            "--model",
-            "sonnet",
-            "--dangerously-skip-permissions",
-            "initial prompt",
-        ])
+    let mut command = f.command();
+    command.args([
+        "run",
+        "--account",
+        account,
+        "--",
+        "--chrome",
+        "--model",
+        "sonnet",
+        "--dangerously-skip-permissions",
+    ]);
+    if f.temp.path().join("initial-resume").exists() {
+        command.args(["--resume", "11111111-1111-4111-8111-111111111111"]);
+    } else if !f.temp.path().join("structural-status").exists() {
+        command.arg("initial prompt");
+    }
+    let child = command
         .env("TEST_BUSY", if busy { "yes" } else { "no" })
         .env("TEST_CONTROL_DIR", f.temp.path())
         .env("TEST_CS_BINARY", env!("CARGO_BIN_EXE_cs"))
@@ -385,6 +406,151 @@ fn wait_until(f: &Fixture, predicate: impl Fn() -> bool) {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+fn assert_no_daemon(f: &Fixture) {
+    assert!(!f.data.join("cs/proxy.json").exists());
+    assert!(!f.data.join("cs/daemon.log").exists());
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(exe) = fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        if exe != std::path::Path::new(env!("CARGO_BIN_EXE_cs")) {
+            continue;
+        }
+        let cmd = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        assert!(!cmd.split(|b| *b == 0).skip(1).any(|arg| arg == b"start"));
+    }
+}
+
+fn structural_switch(plain: bool, busy: bool, resume: bool) {
+    let f = interactive_fixture();
+    fs::write(f.temp.path().join("structural-status"), "").unwrap();
+    if resume {
+        fs::write(f.temp.path().join("initial-resume"), "").unwrap();
+    }
+    let _running = start_interactive(&f, "a", busy);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().values().any(|s| {
+            s["child"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| f.source.join(format!("sessions/{pid}.json")).exists())
+        })
+    });
+    let before = controls(&f)
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(before["busy"], true);
+    assert_no_daemon(&f);
+    let args = if plain {
+        vec!["switch", "b", "--yes"]
+    } else {
+        vec!["switch", "b", "--only", "a"]
+    };
+    let output = f.command().args(args).output().unwrap();
+    assert!(output.status.success(), "switch failed");
+    if busy {
+        assert!(before["last_prompt_at_ms"].as_i64().unwrap() > 0);
+        let output = f.command().arg("sessions").output().unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("waiting: Claude busy"));
+        fs::write(f.temp.path().join("probe-busy"), "").unwrap();
+        wait_until(&f, || f.temp.path().join("busy-observed").exists());
+        assert_eq!(
+            controls(&f).as_object().unwrap().values().next().unwrap()["child"],
+            before["child"]
+        );
+        assert!(!f.temp.path().join("terminated.jsonl").exists());
+        fs::write(f.temp.path().join("finish-response"), "").unwrap();
+    }
+    wait_until(&f, || {
+        controls(&f)
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["alias"] == "b" && s["switching"] == false)
+    });
+    if !busy {
+        assert!(String::from_utf8_lossy(&output.stdout).contains("switching now (Claude is idle)"));
+    }
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["providers"]["claude"]["current"],
+        if plain { "b" } else { "a" }
+    );
+    let terminated: Value = serde_json::from_str(
+        fs::read_to_string(f.temp.path().join("terminated.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminated["pid"], before["child"]["pid"]);
+    let launches: Vec<Value> = fs::read_to_string(f.temp.path().join("launches.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(launches.len(), 2);
+    assert_eq!(launches[1]["email"], "b@x");
+    assert_eq!(launches[1]["root"], before["root"]);
+    assert!(launches[1]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|arg| arg == "--resume"));
+    assert_no_daemon(&f);
+}
+
+#[test]
+fn targeted_switch_uses_live_idle_record_without_notification_or_daemon() {
+    structural_switch(false, false, false);
+}
+
+#[test]
+fn plain_switch_uses_live_idle_record_without_notification_or_daemon() {
+    structural_switch(true, false, false);
+}
+
+#[test]
+fn resumed_idle_session_switches_without_prompt_or_notification() {
+    structural_switch(false, false, true);
+}
+
+#[test]
+fn queued_session_explains_missing_idle_signal_from_older_claude() {
+    let f = interactive_fixture();
+    fs::write(f.temp.path().join("structural-status"), "").unwrap();
+    fs::write(f.temp.path().join("legacy-status"), "").unwrap();
+    let _running = start_interactive(&f, "a", false);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().values().any(|s| {
+            s["child"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| f.source.join(format!("sessions/{pid}.json")).exists())
+        })
+    });
+    let output = f
+        .command()
+        .args(["switch", "b", "--only", "a"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("waiting for Claude to become idle"));
+    let output = f.command().arg("sessions").output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("waiting: no idle signal from Claude"));
+    assert!(!f.temp.path().join("terminated.jsonl").exists());
+    assert_no_daemon(&f);
+}
+
+#[test]
+fn live_busy_record_waits_for_idle_without_notification_or_daemon() {
+    structural_switch(false, true, false);
+}
+
 #[test]
 fn targeted_batch_waits_for_response_and_agents_then_resumes_only_selected_sessions() {
     let f = interactive_fixture();
@@ -420,6 +586,8 @@ fn targeted_batch_waits_for_response_and_agents_then_resumes_only_selected_sessi
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Queued"));
+    let status = f.command().arg("sessions").output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("waiting: background agents"));
     fs::write(f.temp.path().join("finish-response"), "").unwrap();
     wait_until(&f, || {
         original

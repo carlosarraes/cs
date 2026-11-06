@@ -239,8 +239,9 @@ Selectors leave the shared login unchanged and cannot be combined with `--yes`.
 A targeted switch validates the destination and queues a restart of only the
 selected conversations, preserving their UUID, working directory, and supported
 launch flags. It leaves the shared login and other processes alone. By default
-it waits for Claude's idle notification (typically about a minute after a response,
-with no background agents). For a session waiting on a quota reset, use
+it waits for Claude to report idle with no background agents.
+Idle sessions switch immediately; `cs start` is not needed for switching.
+For a session waiting on a quota reset, use
 `--interrupt` to deliberately interrupt it and resume immediately.
 Check queued switches and failures with `cs sessions`; a queued message does
 not mean the move has completed. If the replacement fails before confirming its

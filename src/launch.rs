@@ -172,6 +172,7 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
                     alias: alias.clone(),
                     email: account.email.clone(),
                     busy: true,
+                    last_prompt_at_ms: 0,
                     agents: Default::default(),
                     unsupported,
                     request: None,
@@ -531,7 +532,7 @@ fn supervise(
                     match prepare_move(&session, args, source, token) {
                         Ok(prepared) => {
                             let still_idle = controls.update(|s| {
-                                if !s.get(token).is_some_and(|c| c.root == session.root && c.alias == session.alias && (prepared.target.interrupt || (!c.busy && c.agents.is_empty())) && c.child.as_ref() == session.child.as_ref()) { return Ok(false); }
+                                if !s.get(token).is_some_and(|c| c.root == session.root && c.alias == session.alias && (prepared.target.interrupt || c.can_switch()) && c.child.as_ref() == session.child.as_ref()) { return Ok(false); }
                                 store.update(|s| {
                                     s.leases.get_mut(token).context("missing launch lease")?.process = Process::current()?;
                                     Ok(())
@@ -686,15 +687,24 @@ pub fn switch_targeted(
         alias,
         email: account.email,
     };
-    Controls::default_path()?.queue(&selected, &target)?;
-    for (_, root, old, _) in selected {
+    let controls = Controls::default_path()?;
+    let idle = controls.update(|sessions| {
+        Ok(selected
+            .iter()
+            .map(|(token, _, _, _)| sessions.get(token).is_some_and(Session::can_switch))
+            .collect::<Vec<_>>())
+    })?;
+    controls.queue(&selected, &target)?;
+    for ((_, root, old, _), idle) in selected.into_iter().zip(idle) {
         println!(
-            "Queued {root}: {old} -> {} ({})",
+            "Queued {root}: {old} -> {}: {}",
             target.alias,
             if interrupt {
                 "interrupting selected session"
+            } else if idle {
+                "switching now (Claude is idle)"
             } else {
-                "waiting for Claude idle notification; typically about 60 seconds after the response"
+                "waiting for Claude to become idle"
             }
         );
     }
@@ -780,7 +790,18 @@ pub fn sessions() -> Result<()> {
                 .and_then(|c| {
                     c.request
                         .as_ref()
-                        .map(|target| format!("  -> {} (queued)", target.alias))
+                        .map(|target| {
+                            let reason = if c.switching || target.interrupt {
+                                None
+                            } else {
+                                c.waiting_reason()
+                            };
+                            format!(
+                                "  -> {} (queued{})",
+                                target.alias,
+                                reason.map(|r| format!("; {r}")).unwrap_or_default()
+                            )
+                        })
                         .or_else(|| c.error.as_ref().map(|error| format!("  switch: {error}")))
                 })
                 .unwrap_or_default();

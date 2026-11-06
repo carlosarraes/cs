@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub struct Session {
     pub alias: String,
     pub email: String,
     pub busy: bool,
+    #[serde(default)]
+    pub last_prompt_at_ms: i64,
     pub agents: BTreeSet<String>,
     pub unsupported: Option<String>,
     pub request: Option<Target>,
@@ -33,6 +35,63 @@ pub struct Session {
     pub starting: Option<Target>,
     pub error: Option<String>,
     pub cwd: PathBuf,
+}
+
+fn record_proves_idle(record: &serde_json::Value, session: &Session, child: &Process) -> bool {
+    // Only the status timestamp establishes freshness; updatedAt can change
+    // without a status transition. Keep idle_prompt as the fallback.
+    record["pid"].as_u64() == Some(u64::from(child.pid))
+        && record["procStart"]
+            .as_str()
+            .is_some_and(|start| child.matches_claude_start(start))
+        && record["sessionId"].as_str() == Some(session.root.as_str())
+        && record["status"].as_str() == Some("idle")
+        && record
+            .get("statusUpdatedAt")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|time| time >= session.last_prompt_at_ms)
+        && session.agents.is_empty()
+}
+
+fn read_record(profile: &Path, child: &Process) -> Option<serde_json::Value> {
+    let path = profile.join("sessions").join(format!("{}.json", child.pid));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+impl Session {
+    fn live_record(&self) -> Option<serde_json::Value> {
+        let child = self.child.as_ref()?;
+        read_record(&crate::native::profile_path(&self.alias).ok()?, child)
+    }
+
+    pub fn can_switch(&self) -> bool {
+        self.waiting_reason().is_none()
+    }
+
+    pub fn waiting_reason(&self) -> Option<String> {
+        if !self.agents.is_empty() {
+            return Some("waiting: background agents".into());
+        }
+        if !self.busy {
+            return None;
+        }
+        let record = self.live_record();
+        if self.child.as_ref().is_some_and(|child| {
+            record
+                .as_ref()
+                .is_some_and(|record| record_proves_idle(record, self, child))
+        }) {
+            return None;
+        }
+        if self.last_prompt_at_ms > 0
+            || record
+                .as_ref()
+                .is_some_and(|record| record["status"] == "busy")
+        {
+            return Some("waiting: Claude busy".into());
+        }
+        Some("waiting: no idle signal from Claude".into())
+    }
 }
 
 pub struct Controls {
@@ -100,8 +159,7 @@ impl Controls {
                 return Ok(None);
             };
             if session.request.is_none()
-                || (!session.request.as_ref().is_some_and(|r| r.interrupt)
-                    && (session.busy || !session.agents.is_empty()))
+                || (!session.request.as_ref().is_some_and(|r| r.interrupt) && !session.can_switch())
                 || session.switching
             {
                 return Ok(None);
@@ -189,7 +247,10 @@ impl Controls {
                 session.root = root.into();
             }
             match kind {
-                "UserPromptSubmit" => session.busy = true,
+                "UserPromptSubmit" => {
+                    session.busy = true;
+                    session.last_prompt_at_ms = chrono::Utc::now().timestamp_millis();
+                },
                 "StopFailure" => session.busy = false,
                 "Notification" => match payload["notification_type"].as_str() {
                     Some("idle_prompt") => { session.busy = false; session.agents.clear(); }
@@ -274,6 +335,7 @@ mod tests {
             alias: alias.into(),
             email: format!("{alias}@x"),
             busy: false,
+            last_prompt_at_ms: 0,
             agents: BTreeSet::new(),
             unsupported: None,
             request: None,
@@ -291,6 +353,131 @@ mod tests {
             email: "b@x".into(),
         }
     }
+    fn idle_fixture() -> (Session, Process, serde_json::Value) {
+        let mut session = session("a", "fixture-root");
+        let child = Process {
+            pid: 42,
+            start: if cfg!(target_os = "linux") {
+                "fixture-boot:123"
+            } else {
+                "1735689600:123456"
+            }
+            .into(),
+        };
+        session.child = Some(child.clone());
+        session.busy = true;
+        session.last_prompt_at_ms = 1000;
+        let record = serde_json::json!({
+            "pid": 42, "sessionId": "fixture-root", "status": "idle",
+            "procStart": if cfg!(target_os = "linux") { "123" } else { "Wed Jan  1 00:00:00 2025" },
+            "statusUpdatedAt": 1000, "version": "2.1.319"
+        });
+        (session, child, record)
+    }
+
+    #[test]
+    fn matching_idle_record_proves_idle() {
+        let (session, child, record) = idle_fixture();
+        assert!(record_proves_idle(&record, &session, &child));
+    }
+
+    #[test]
+    fn idle_record_rejects_busy_unknown_missing_and_stale_status() {
+        let (session, child, record) = idle_fixture();
+        for (field, value) in [
+            ("status", serde_json::json!("busy")),
+            ("status", serde_json::json!("waiting")),
+            ("status", serde_json::Value::Null),
+            ("statusUpdatedAt", serde_json::json!(999)),
+            ("statusUpdatedAt", serde_json::Value::Null),
+            ("statusUpdatedAt", serde_json::json!("1000")),
+        ] {
+            let mut changed = record.clone();
+            changed[field] = value;
+            assert!(
+                !record_proves_idle(&changed, &session, &child),
+                "accepted invalid {field}"
+            );
+        }
+        let mut changed = record.clone();
+        changed.as_object_mut().unwrap().remove("status");
+        assert!(!record_proves_idle(&changed, &session, &child));
+        changed = record;
+        changed["statusUpdatedAt"] = serde_json::json!(999);
+        changed["updatedAt"] = serde_json::json!(2000);
+        assert!(!record_proves_idle(&changed, &session, &child));
+    }
+
+    #[test]
+    fn idle_record_requires_status_timestamp_even_with_fresh_updated_at() {
+        let (session, child, mut record) = idle_fixture();
+        record.as_object_mut().unwrap().remove("statusUpdatedAt");
+        record["updatedAt"] = serde_json::json!(2000);
+        assert!(!record_proves_idle(&record, &session, &child));
+    }
+
+    #[test]
+    fn idle_record_rejects_mismatched_or_missing_process_and_session_identity() {
+        let (session, child, record) = idle_fixture();
+        for (field, value) in [
+            ("pid", serde_json::json!(43)),
+            ("procStart", serde_json::json!("different-start")),
+            ("sessionId", serde_json::json!("different-root")),
+        ] {
+            let mut changed = record.clone();
+            changed[field] = value;
+            assert!(
+                !record_proves_idle(&changed, &session, &child),
+                "accepted mismatched {field}"
+            );
+            changed.as_object_mut().unwrap().remove(field);
+            assert!(
+                !record_proves_idle(&changed, &session, &child),
+                "accepted missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_record_cannot_override_background_agents() {
+        let (mut session, child, record) = idle_fixture();
+        session.agents.insert("fixture-agent".into());
+        assert!(!record_proves_idle(&record, &session, &child));
+        assert!(!session.can_switch());
+        assert_eq!(
+            session.waiting_reason().as_deref(),
+            Some("waiting: background agents")
+        );
+    }
+
+    #[test]
+    fn missing_or_unparsable_record_cannot_prove_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, child, _) = idle_fixture();
+        assert!(read_record(dir.path(), &child).is_none());
+        std::fs::create_dir(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/42.json"), "invalid json").unwrap();
+        assert!(read_record(dir.path(), &child).is_none());
+    }
+
+    #[test]
+    fn old_controls_without_last_prompt_timestamp_still_load_and_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let controls = Controls {
+            path: dir.path().join("controls.json"),
+        };
+        let mut value = serde_json::to_value(session("a", "fixture-root")).unwrap();
+        value.as_object_mut().unwrap().remove("last_prompt_at_ms");
+        value["request"] = serde_json::to_value(target()).unwrap();
+        std::fs::write(
+            &controls.path,
+            serde_json::to_vec(&serde_json::json!({"fixture":value})).unwrap(),
+        )
+        .unwrap();
+        let claimed = controls.claim("fixture").unwrap().unwrap();
+        assert_eq!(claimed.last_prompt_at_ms, 0);
+    }
+
     #[test]
     fn legacy_directory_blocker_cannot_enable_a_noninteractive_launcher() {
         let dir = tempfile::tempdir().unwrap();

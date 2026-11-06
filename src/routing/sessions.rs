@@ -13,6 +13,23 @@ impl Process {
     pub fn read(pid: u32) -> Option<Self> {
         process_start(pid).map(|start| Self { pid, start })
     }
+    pub fn matches_claude_start(&self, recorded: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.start
+                .split_once(':')
+                .is_some_and(|(_, ticks)| ticks == recorded)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Claude's Unix start identity is `LC_ALL=C TZ=UTC ps -o lstart=`.
+            self.start
+                .split_once(':')
+                .and_then(|(seconds, _)| seconds.parse::<i64>().ok())
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .is_some_and(|time| time.format("%a %b %e %T %Y").to_string() == recorded)
+        }
+    }
     pub fn has_terminal_stdin(&self) -> bool {
         self.alive() && terminal_stdin(self.pid) && self.alive()
     }
