@@ -136,6 +136,13 @@ impl Drop for RemoteLease {
         }
     }
 }
+/// t3 kills the shim pid and cannot own an ssh lease, so borrowing stays out of that path.
+fn reject_t3_borrow(flag: Option<&str>, env: Option<&std::ffi::OsStr>) -> Result<()> {
+    if flag.is_some() || env.is_some() {
+        bail!("cs t3-claude does not support --borrow or CS_BORROW; use cs run --borrow HOST or unset CS_BORROW");
+    }
+    Ok(())
+}
 pub fn dispatch(
     mut args: Vec<OsString>,
     requested: Option<&str>,
@@ -158,6 +165,9 @@ pub fn dispatch(
         } else {
             remaining.push(arg);
         }
+    }
+    if !pick && !run {
+        reject_t3_borrow(host.as_deref(), std::env::var_os("CS_BORROW").as_deref())?;
     }
     let host = host.or_else(|| std::env::var("CS_BORROW").ok());
     let Some(host) = host else {
@@ -229,4 +239,18 @@ pub fn dispatch(
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn t3_shim_rejects_borrow_from_flag_or_environment() {
+        assert!(reject_t3_borrow(Some("owner"), None).is_err());
+        assert!(reject_t3_borrow(None, Some(OsStr::new("owner"))).is_err());
+        assert!(reject_t3_borrow(None, Some(OsStr::new(""))).is_err());
+        assert!(reject_t3_borrow(None, None).is_ok());
+    }
 }

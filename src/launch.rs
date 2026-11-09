@@ -812,7 +812,7 @@ pub fn sessions() -> Result<()> {
 }
 
 pub fn t3_claude(args: Vec<OsString>, pick: bool) -> Result<()> {
-    let mut accounts = state::State::load()?;
+    let accounts = state::State::load()?;
     if accounts
         .claude()
         .accounts
@@ -830,125 +830,88 @@ pub fn t3_claude(args: Vec<OsString>, pick: bool) -> Result<()> {
             .exec()
             .into());
     }
-    let source = crate::native::source_config()?;
+    if pick {
+        return t3_pick(accounts);
+    }
+    t3_exec(args, accounts)
+}
+
+fn t3_pick(mut accounts: state::State) -> Result<()> {
     let root = uuid::Uuid::new_v4().to_string();
-    let forced: Option<String> = None;
     let cfg = crate::config::load()?.routing;
     let mut observation = crate::usage::Observation::load()?.unwrap_or_default();
-    if forced.is_none()
-        && crate::routing::policy::select(
-            &observation
-                .accounts
-                .iter()
-                .filter(|(alias, _)| {
-                    accounts
-                        .claude()
-                        .accounts
-                        .get(*alias)
-                        .is_some_and(|account| {
-                            crate::routing::store::token_valid(account, crate::usage::now())
-                        })
-                })
-                .map(|(alias, entry)| (alias.clone(), entry.clone()))
-                .collect(),
-            &Default::default(),
-            crate::usage::now(),
-            cfg.five_hour_ceiling,
-            cfg.weekly_ceiling,
-            cfg.max_usage_age_secs as i64,
-        )
-        .is_none()
-    {
+    if !has_routable_account(&accounts, &observation, &cfg) {
         crate::accounts::poll()?;
         accounts = state::State::load()?;
         observation = crate::usage::Observation::load()?.unwrap_or_default();
     }
     let store = Store::default_path()?;
     let token = store.register()?;
-    let mut exit_status = None;
-    let result = (|| -> Result<()> {
-        let (account, alias) = store.reserve_native(
-            &token,
-            &root,
-            forced.as_deref(),
-            &accounts,
-            &observation.accounts,
-            &cfg,
-        )?;
-        if pick {
-            println!("{alias} ({})", account.email);
-            return Ok(());
-        }
-        let profile = crate::native::prepare(&alias, &account, &source)?;
-        let mut command = if account.is_key() {
-            crate::native::key_command(&profile, args.clone(), &alias)?
-        } else {
-            crate::native::command(&profile, args.clone())?
-        };
-        command.env("CS_NATIVE_LEASE", &token);
-        use std::io::IsTerminal;
-        let unsupported = if account.is_key() {
-            Some("API key conversations cannot change accounts; start a new conversation".into())
-        } else if !std::io::stdin().is_terminal() {
-            Some("headless sessions cannot be switched while running".into())
-        } else {
-            crate::session_control::resume_args(&args, &root)
-                .err()
-                .map(|e| e.to_string())
-        };
-        Controls::default_path()?.update(|sessions| {
-            sessions.insert(
-                token.clone(),
-                Session {
-                    generation: String::new(),
-                    owner: Process::current()?,
-                    child: None,
-                    root: root.clone(),
-                    alias: alias.clone(),
-                    email: account.email.clone(),
-                    busy: true,
-                    last_prompt_at_ms: 0,
-                    agents: Default::default(),
-                    unsupported,
-                    request: None,
-                    switching: false,
-                    starting: None,
-                    error: None,
-                    cwd: std::env::current_dir()?,
-                },
-            );
-            Ok(())
-        })?;
-        eprintln!("cs: t3-claude -> {alias} ({})", account.email);
-        let status = supervise(
-            command,
-            &store,
-            &token,
-            &alias,
-            &account.email,
-            &args,
-            &source,
-            !account.is_key(),
-        )?;
-        exit_status = Some(status);
-        Ok(())
-    })();
-    let cleanup = store.unregister(&token);
-    let controls_cleanup = Controls::default_path()?.update(|sessions| {
-        sessions.remove(&token);
-        Ok(())
-    });
-    result.and(cleanup).and(controls_cleanup)?;
-    if pick {
-        return Ok(());
-    }
-    use std::os::unix::process::ExitStatusExt;
-    let status = exit_status.context("missing child status")?;
-    std::process::exit(
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+    let result = store
+        .reserve_native(&token, &root, None, &accounts, &observation.accounts, &cfg)
+        .map(|(account, alias)| println!("{alias} ({})", account.email));
+    result.and(store.unregister(&token))
+}
+
+fn has_routable_account(
+    accounts: &state::State,
+    observation: &crate::usage::Observation,
+    cfg: &crate::config::Routing,
+) -> bool {
+    crate::routing::policy::select(
+        &observation
+            .accounts
+            .iter()
+            .filter(|(alias, _)| {
+                accounts
+                    .claude()
+                    .accounts
+                    .get(*alias)
+                    .is_some_and(|account| {
+                        crate::routing::store::token_valid(account, crate::usage::now())
+                    })
+            })
+            .map(|(alias, entry)| (alias.clone(), entry.clone()))
+            .collect(),
+        &Default::default(),
+        crate::usage::now(),
+        cfg.five_hour_ceiling,
+        cfg.weekly_ceiling,
+        cfg.max_usage_age_secs as i64,
     )
+    .is_some()
+}
+
+/// t3 tracks and kills the pid it spawned and expects it to be Claude itself, so this path
+/// picks an account from local state only and replaces this process with Claude. No
+/// supervisor, credential renewal, or network access may live here.
+fn t3_exec(args: Vec<OsString>, accounts: state::State) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let source = crate::native::source_config()?;
+    let root = uuid::Uuid::new_v4().to_string();
+    let cfg = crate::config::load()?.routing;
+    let observation = crate::usage::Observation::load()?.unwrap_or_default();
+    let store = Store::default_path()?;
+    let token = store.register()?;
+    let launch = (|| -> Result<(crate::native::NativeCommand, String, String)> {
+        let (account, alias) =
+            store.reserve_native(&token, &root, None, &accounts, &observation.accounts, &cfg)?;
+        let profile = crate::native::prepare_exec(&alias, &account, &source)?;
+        let mut command = crate::native::exec_command(&profile, args)?;
+        command.env("CS_NATIVE_LEASE", &token);
+        Ok((command, alias, account.email))
+    })();
+    let (mut command, alias, email) = match launch {
+        Ok(launch) => launch,
+        Err(error) => {
+            let _ = store.unregister(&token);
+            return Err(error);
+        }
+    };
+    eprintln!("cs: t3-claude -> {alias} ({email})");
+    let error = command.exec();
+    let _ = store.unregister(&token);
+    Err(anyhow::Error::from(error).context("launching Claude"))
 }
 
 #[cfg(test)]

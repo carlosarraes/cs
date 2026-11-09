@@ -270,9 +270,73 @@ pub fn prepare(alias: &str, account: &state::Account, source: &Path) -> Result<P
     Ok(profile)
 }
 
+/// Prepare a profile for an `exec` launch where nothing stays alive to write tokens back.
+/// A still-valid profile token that Claude may have refreshed is kept, never replaced by a
+/// staler stored one, and a fresher matching one is imported into the saved account first.
+pub fn prepare_exec(alias: &str, account: &state::Account, source: &Path) -> Result<PathBuf> {
+    if account.is_key() {
+        bail!("{alias}: API key accounts cannot launch through the exec path");
+    }
+    let _credentials = crate::accounts::credential_lock()?;
+    let profile = profile_path(alias)?;
+    let source_global = if source == util::home()?.join(".claude") {
+        util::home()?.join(".claude.json")
+    } else {
+        source.join(".claude.json")
+    };
+    prepare_files(&profile, source, &read_json(&source_global)?, account)?;
+    let saved = &account.data["claudeAiOauth"];
+    let now_ms = crate::usage::now().saturating_mul(1000);
+    match crate::claude::read_profile_oauth(&profile)? {
+        Some(existing) if oauth_valid(&existing, now_ms) => {
+            if expires_at(&existing) > expires_at(saved) {
+                import_profile_token(alias, &account.email, saved, &existing)?;
+            }
+            if expires_at(&existing) >= expires_at(saved) {
+                return Ok(profile);
+            }
+        }
+        _ => {}
+    }
+    crate::claude::write_profile_oauth(&profile, &access_credentials(saved))?;
+    Ok(profile)
+}
+
+fn expires_at(oauth: &Value) -> i64 {
+    oauth["expiresAt"].as_i64().unwrap_or(0)
+}
+
+fn oauth_valid(oauth: &Value, now_ms: i64) -> bool {
+    oauth["accessToken"].as_str().is_some_and(|s| !s.is_empty()) && expires_at(oauth) > now_ms
+}
+
+/// Persist a token Claude refreshed inside the profile, keeping the saved refresh grant
+/// unless the profile carries a rotated one. Skipped if the saved account changed meanwhile.
+fn import_profile_token(alias: &str, email: &str, saved: &Value, profile: &Value) -> Result<()> {
+    let _lock = state::lock()?;
+    let mut latest = state::State::load()?;
+    let Some(target) = latest.claude_mut().accounts.get_mut(alias) else {
+        return Ok(());
+    };
+    if target.email != email || target.data["claudeAiOauth"] != *saved {
+        return Ok(());
+    }
+    let (Some(merged), Some(from_profile)) = (
+        target.data["claudeAiOauth"].as_object_mut(),
+        profile.as_object(),
+    ) else {
+        return Ok(());
+    };
+    for (key, value) in from_profile {
+        merged.insert(key.clone(), value.clone());
+    }
+    latest.save()
+}
+
 pub struct NativeCommand {
     inner: Command,
     settings: PathBuf,
+    keep_settings: bool,
 }
 impl std::ops::Deref for NativeCommand {
     type Target = Command;
@@ -287,11 +351,29 @@ impl std::ops::DerefMut for NativeCommand {
 }
 impl Drop for NativeCommand {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.settings);
+        if !self.keep_settings {
+            let _ = fs::remove_file(&self.settings);
+        }
     }
 }
 
-pub fn command(profile: &Path, mut args: Vec<OsString>) -> Result<NativeCommand> {
+pub const EXEC_SETTINGS_FILE: &str = "t3-launch-settings.json";
+
+pub fn command(profile: &Path, args: Vec<OsString>) -> Result<NativeCommand> {
+    build_command(profile, args, None)
+}
+
+/// Like `command`, but the settings file has a stable per-profile name that is
+/// overwritten on each launch, since an exec'd process never runs `Drop` to delete it.
+pub fn exec_command(profile: &Path, args: Vec<OsString>) -> Result<NativeCommand> {
+    build_command(profile, args, Some(EXEC_SETTINGS_FILE))
+}
+
+fn build_command(
+    profile: &Path,
+    mut args: Vec<OsString>,
+    stable_settings: Option<&str>,
+) -> Result<NativeCommand> {
     for path in [
         std::env::current_dir()?.join(".claude/settings.json"),
         std::env::current_dir()?.join(".claude/settings.local.json"),
@@ -377,7 +459,10 @@ pub fn command(profile: &Path, mut args: Vec<OsString>) -> Result<NativeCommand>
             .push(hook.clone());
     }
     let index = args.iter().position(|a| a == "--").unwrap_or(args.len());
-    let settings_file = profile.join(format!("launch-settings-{}.json", uuid::Uuid::new_v4()));
+    let settings_file = profile.join(match stable_settings {
+        Some(name) => name.to_string(),
+        None => format!("launch-settings-{}.json", uuid::Uuid::new_v4()),
+    });
     util::atomic_write(&settings_file, &serde_json::to_vec(&settings)?)?;
     args.splice(
         index..index,
@@ -412,6 +497,7 @@ pub fn command(profile: &Path, mut args: Vec<OsString>) -> Result<NativeCommand>
     Ok(NativeCommand {
         inner: cmd,
         settings: settings_file,
+        keep_settings: stable_settings.is_some(),
     })
 }
 
@@ -604,5 +690,39 @@ mod tests {
             env[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")],
             Some(temp.path().as_os_str())
         );
+    }
+
+    #[test]
+    fn exec_command_reuses_one_settings_file_that_outlives_the_command() {
+        let d = tempfile::tempdir().unwrap();
+        let first = exec_command(d.path(), vec!["--version".into()]).unwrap();
+        let path = first.settings.clone();
+        assert_eq!(path, d.path().join(EXEC_SETTINGS_FILE));
+        drop(first);
+        assert!(path.exists());
+        let second = exec_command(d.path(), vec!["--version".into()]).unwrap();
+        assert_eq!(second.settings, path);
+        let launch_files = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("settings")
+            })
+            .count();
+        assert_eq!(launch_files, 1);
+        let args: Vec<_> = second.get_args().collect();
+        assert_eq!(args[0], "--version");
+        assert_eq!(args[1], "--settings");
+    }
+
+    #[test]
+    fn oauth_validity_requires_token_and_future_expiry() {
+        assert!(oauth_valid(&json!({"accessToken":"t","expiresAt":10}), 5));
+        assert!(!oauth_valid(&json!({"accessToken":"t","expiresAt":5}), 5));
+        assert!(!oauth_valid(&json!({"accessToken":"","expiresAt":10}), 5));
+        assert!(!oauth_valid(&json!({"expiresAt":10}), 5));
     }
 }

@@ -141,9 +141,16 @@ currently selected account. Utilities create no conversation or session count.
 Other arguments use normal quota admission; config is not a Claude subcommand.
 
 Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.
+t3 tracks and kills the pid it spawns, so t3-claude picks an account from local state only
+(no network, ssh, renewal, or usage polling), then execs claude; no wrapper stays alive,
+so there is no supervision, 30s credential renewal, or in-place switching for t3 sessions.
+Its pid is the lease; dead pids are reaped by the next routing update. A still-valid profile
+token is kept and a fresher one is imported into the saved account. Stale usage fails fast:
+refresh it with cs usage --live or the cs start daemon.
 
-Borrow: cs run --borrow HOST -- <claude args>; cs t3-claude --borrow HOST;
-cs pick --borrow HOST. CS_BORROW sets the default host, including cs-t3-claude.
+Borrow: cs run --borrow HOST -- <claude args>; cs pick --borrow HOST.
+cs t3-claude and cs-t3-claude reject --borrow and CS_BORROW (borrow stays out of t3 for now).
+CS_BORROW sets the default host for cs run and cs pick.
 CLI --borrow overrides the environment and conflicts with --account.
 Owner SSH commands: cs lend emits an access-only JSON grant; cs lend-release LEASE_ID
 releases its durable lease. Refresh credentials remain on the owner.

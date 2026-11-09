@@ -1363,6 +1363,130 @@ fn t3_pick_avoids_account_with_live_session() {
     assert_eq!(output.stdout, b"b (b@x)\n");
 }
 
+fn wait_for(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn t3_shim_becomes_claude_and_leaves_no_wrapper_or_stray_files() {
+    let f = Fixture::new();
+    for _ in 0..2 {
+        let _ = fs::remove_file(f.temp.path().join("child.pid"));
+        let mut child = f
+            .command()
+            .arg("t3-claude")
+            .args(["--output-format", "stream-json", "--verbose"])
+            .env("TEST_WAIT", "yes")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for(&f.temp.path().join("child.pid"));
+        let claude_pid = fs::read_to_string(f.temp.path().join("child.pid")).unwrap();
+        assert_eq!(claude_pid.trim(), child.id().to_string());
+        let leases = f.registry()["leases"].as_object().unwrap().clone();
+        assert!(leases
+            .values()
+            .any(|lease| lease["process"]["pid"] == child.id()));
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        child.wait().unwrap();
+    }
+    let profile = f.data.join("cs/profiles/61");
+    let launch_files: Vec<_> = fs::read_dir(&profile)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("settings") && name != "settings.json")
+        .collect();
+    assert_eq!(launch_files, ["t3-launch-settings.json"]);
+    let args = fs::read_to_string(f.temp.path().join("args")).unwrap();
+    assert!(args.contains(profile.join("t3-launch-settings.json").to_str().unwrap()));
+}
+
+#[test]
+fn t3_shim_passes_version_and_session_args_through_the_same_exec() {
+    let f = Fixture::new();
+    let output = f
+        .command()
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let args = fs::read_to_string(f.temp.path().join("args")).unwrap();
+    assert_eq!(args.lines().next(), Some("--version"));
+}
+
+#[test]
+fn t3_shim_rejects_borrow_without_touching_ssh_or_claude() {
+    let f = Fixture::new();
+    let ssh = f.bin.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\necho called >> \"$TEST_SIGNALS\"\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    for (flags, env) in [(vec!["--borrow=owner"], None), (vec![], Some("owner"))] {
+        let mut command = f.command();
+        command.env("CS_SSH", &ssh).arg("t3-claude").args(flags);
+        if let Some(host) = env {
+            command.env("CS_BORROW", host);
+        }
+        let output = command.arg("--version").output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("does not support --borrow"));
+    }
+    assert!(!f.temp.path().join("signals").exists());
+    assert!(!f.temp.path().join("args").exists());
+}
+
+#[test]
+fn t3_shim_keeps_a_valid_profile_token_and_imports_a_fresher_one() {
+    let f = Fixture::new();
+    assert!(f
+        .command()
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let profile = f.data.join("cs/profiles/61");
+    let creds = profile.join(".credentials.json");
+    let fresher = (chrono::Utc::now().timestamp() + 20000) * 1000;
+    let rotated = json!({"claudeAiOauth":{"accessToken":"profile-access","refreshToken":"profile-refresh","expiresAt":fresher}});
+    fs::write(&creds, rotated.to_string()).unwrap();
+    assert!(f
+        .command()
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let kept: Value = serde_json::from_slice(&fs::read(&creds).unwrap()).unwrap();
+    assert_eq!(kept, rotated);
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
+    let saved = &state["providers"]["claude"]["accounts"]["a"]["data"]["claudeAiOauth"];
+    assert_eq!(saved["accessToken"], "profile-access");
+    assert_eq!(saved["refreshToken"], "profile-refresh");
+
+    let stale = json!({"claudeAiOauth":{"accessToken":"old","expiresAt":(chrono::Utc::now().timestamp() + 60) * 1000}});
+    fs::write(&creds, stale.to_string()).unwrap();
+    assert!(f
+        .command()
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let replaced: Value = serde_json::from_slice(&fs::read(&creds).unwrap()).unwrap();
+    assert_eq!(replaced["claudeAiOauth"]["accessToken"], "profile-access");
+    assert!(replaced["claudeAiOauth"].get("refreshToken").is_none());
+}
+
 #[test]
 fn borrowed_launches_release_and_keep_grants_out_of_storage_and_errors() {
     for exit in [0, 7, 143] {
@@ -1393,9 +1517,10 @@ exit {exit}
             .command()
             .env("CS_SSH", &ssh)
             .args([
-                "t3-claude",
-                "-p",
+                "run",
                 "--borrow=owner",
+                "--",
+                "-p",
                 "--output-format",
                 "stream-json",
             ])
@@ -1474,7 +1599,7 @@ echo '{"alias":"owner","email":"owner@x","lease_id":"lease","expires_at":9999999
 }
 
 #[test]
-fn borrowed_shim_releases_after_sigterm() {
+fn borrowed_run_releases_after_sigterm() {
     let f = Fixture::new();
     let ssh = f.bin.join("ssh");
     fs::write(&ssh, r#"#!/bin/sh
@@ -1491,12 +1616,10 @@ while :; do sleep 0.1; done
 "#,
     )
     .unwrap();
-    let shim = f.bin.join("cs-t3-claude");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cs"), &shim).unwrap();
     let mut command = f.command();
-    command.env("CS_SSH", &ssh).env("CS_BORROW", "owner");
-    use std::os::unix::process::CommandExt;
-    command.arg0("cs-t3-claude");
+    command
+        .env("CS_SSH", &ssh)
+        .args(["run", "--borrow", "owner", "--"]);
     let mut child = command
         .args(["-p", "--output-format", "stream-json"])
         .stdout(Stdio::null())
