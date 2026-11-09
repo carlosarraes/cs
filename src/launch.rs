@@ -928,7 +928,7 @@ pub fn t3_claude(args: Vec<OsString>, pick: bool) -> Result<()> {
             &account.email,
             &args,
             &source,
-            false,
+            !account.is_key(),
         )?;
         exit_status = Some(status);
         Ok(())
