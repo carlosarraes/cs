@@ -26,6 +26,7 @@ build: assert-build-host
     cargo build --release
     mkdir -p {{install_dir}}
     cp target/release/{{binary_name}} {{install_dir}}/
+    ln -sfn cs {{install_dir}}/cs-t3-claude
     @echo "Installed {{binary_name}} -> {{install_dir}}/{{binary_name}}"
 
 # Build on a separate host, then atomically install on the destination.
@@ -114,6 +115,7 @@ sync host="mac" builder="mact":
     chmod 755 "$pending"
     "$pending" --version
     mv -f "$pending" "$HOME/.local/bin/cs"
+    ln -sfn cs "$HOME/.local/bin/cs-t3-claude"
     echo "Installed $HOME/.local/bin/cs"
     SH
     pending=""

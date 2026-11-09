@@ -139,3 +139,5 @@ also standalone --help/-h and --version/-v. Put the command first after --.
 Pins retain credential/identity checks with no fallback. Without --account, use the
 currently selected account. Utilities create no conversation or session count.
 Other arguments use normal quota admission; config is not a Claude subcommand.
+
+Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.

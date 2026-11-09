@@ -422,3 +422,5 @@ Honors `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 ## License
 
 [MIT](LICENSE)
+
+Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.

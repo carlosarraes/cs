@@ -48,6 +48,7 @@ esac
 case " $* " in
  *" mcp "*" --settings "*) echo "error: unknown option '--settings'" >&2; exit 2;;
 esac
+printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_ARGS.profile"
 printf '%s\n' "$@" > "$TEST_ARGS"
 printf '%s\n' "$$" > "$TEST_CHILD_PID"
 if [ "$TEST_WAIT" = yes ]; then
@@ -1254,4 +1255,110 @@ fn plain_switch_reapplies_current_shared_login_and_moves_other_aliases() {
         serde_json::from_slice(&fs::read(f.data.join("cs/state.json")).unwrap()).unwrap();
     assert_eq!(state["providers"]["claude"]["current"], "a");
     assert!(state["providers"]["claude"]["previous"].is_null());
+}
+
+#[test]
+fn t3_passthrough_and_pick() {
+    let f = Fixture::new();
+    let flags = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+    ];
+    let pick = f.command().arg("pick").output().unwrap();
+    assert!(
+        pick.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pick.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&pick.stdout), "a (a@x)\n");
+    assert!(!f.temp.path().join("args").exists());
+    let output = f.command().arg("t3-claude").args(flags).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"FAKE_CLAUDE_OK\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("t3-claude -> a (a@x)"));
+    let args = fs::read_to_string(f.temp.path().join("args")).unwrap();
+    assert!(args.starts_with(&flags.join("\n")));
+    let profile = fs::read_to_string(f.temp.path().join("args.profile")).unwrap();
+    assert_eq!(
+        profile.trim(),
+        f.data.join("cs/profiles/61").to_str().unwrap()
+    );
+    use std::os::unix::process::CommandExt;
+    let output = f
+        .command()
+        .arg0("cs-t3-claude")
+        .args(flags)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"FAKE_CLAUDE_OK\n");
+}
+
+#[test]
+fn t3_empty_accounts_preserves_current_environment_and_status() {
+    let f = Fixture::new();
+    fs::write(f.data.join("cs/state.json"), "{}").unwrap();
+    let output = f
+        .command()
+        .arg("t3-claude")
+        .args(["-p", "hello"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"FAKE_CLAUDE_OK\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fallback"));
+    assert_eq!(
+        fs::read_to_string(f.temp.path().join("args")).unwrap(),
+        "-p\nhello\n"
+    );
+    let output = f.command().arg("pick").output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"current\n");
+}
+
+#[test]
+fn t3_pick_avoids_account_with_live_session() {
+    let f = Fixture::new();
+    let path = f.data.join("cs/state.json");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut b = saved["providers"]["claude"]["accounts"]["a"].clone();
+    b["email"] = json!("b@x");
+    b["data"]["oauthAccount"]["emailAddress"] = json!("b@x");
+    saved["providers"]["claude"]["accounts"]["b"] = b;
+    fs::write(path, saved.to_string()).unwrap();
+    let path = f.data.join("cs/usage.json");
+    let mut usage: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    usage["accounts"]["b"] = usage["accounts"]["a"].clone();
+    fs::write(path, usage.to_string()).unwrap();
+    let mut child = f
+        .command()
+        .arg("t3-claude")
+        .arg("-p")
+        .env("TEST_WAIT", "yes")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f.temp.path().join("child.pid").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = f.command().arg("pick").output().unwrap();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    child.wait().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"b (b@x)\n");
 }

@@ -43,6 +43,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Pass Claude arguments through account routing for t3
+    T3Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Name the account automatic routing would select
+    Pick,
     /// Save an Anthropic API key from masked stdin
     AddKey { alias: String },
     /// Save an account under an alias, restoring the previously active login by default
@@ -180,7 +187,14 @@ enum DaemonCommands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::try_parse().unwrap_or_else(|error| {
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    if std::path::Path::new(&argv[0])
+        .file_name()
+        .is_some_and(|name| name == "cs-t3-claude")
+    {
+        argv.insert(1, "t3-claude".into());
+    }
+    let cli = Cli::try_parse_from(argv).unwrap_or_else(|error| {
         if std::env::args_os()
             .skip(1)
             .any(|arg| arg.to_string_lossy().contains("sk-ant-"))
@@ -200,6 +214,8 @@ fn main() -> Result<()> {
         unreachable!("clap requires a command or --llm");
     };
     match command {
+        Commands::T3Claude { args } => launch::t3_claude(args, false),
+        Commands::Pick => launch::t3_claude(Vec::new(), true),
         Commands::AddKey { alias } => commands::add_key(&alias),
         Commands::Add {
             alias,
