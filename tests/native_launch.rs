@@ -93,6 +93,11 @@ printf 'FAKE_CLAUDE_OK\n'
     fn registry(&self) -> Value {
         serde_json::from_slice(&fs::read(self.data.join("cs/routing.json")).unwrap()).unwrap()
     }
+    fn registry_opt(&self) -> Option<Value> {
+        fs::read(self.data.join("cs/routing.json"))
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
 }
 
 #[test]
@@ -1477,26 +1482,6 @@ fn t3_shim_does_not_launch_when_fresh_usage_is_exhausted() {
 }
 
 #[test]
-fn t3_shim_rejects_borrow_without_touching_ssh_or_claude() {
-    let f = Fixture::new();
-    let ssh = f.bin.join("ssh");
-    fs::write(&ssh, "#!/bin/sh\necho called >> \"$TEST_SIGNALS\"\n").unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    for (flags, env) in [(vec!["--borrow=owner"], None), (vec![], Some("owner"))] {
-        let mut command = f.command();
-        command.env("CS_SSH", &ssh).arg("t3-claude").args(flags);
-        if let Some(host) = env {
-            command.env("CS_BORROW", host);
-        }
-        let output = command.arg("--version").output().unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("does not support --borrow"));
-    }
-    assert!(!f.temp.path().join("signals").exists());
-    assert!(!f.temp.path().join("args").exists());
-}
-
-#[test]
 fn t3_shim_keeps_a_valid_profile_token_and_imports_a_fresher_one() {
     let f = Fixture::new();
     assert!(f
@@ -1620,38 +1605,6 @@ fn lend_is_durable_until_release() {
 }
 
 #[test]
-fn borrow_pick_and_invalid_response_do_not_expose_tokens() {
-    let f = Fixture::new();
-    let ssh = f.bin.join("ssh");
-    fs::write(&ssh, r#"#!/bin/sh
-printf '%s\n' "$@" >> "$TEST_SIGNALS"
-case "$*" in *lend-release*) exit 0;; esac
-if [ "$BAD_RESPONSE" = yes ]; then echo 'test-access-aaa invalid'; exit 0; fi
-echo '{"alias":"owner","email":"owner@x","lease_id":"lease","expires_at":9999999999,"access_token":"test-access-aaa"}'
-"#).unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = f
-        .command()
-        .env("CS_SSH", &ssh)
-        .env("CS_BORROW", "fallback")
-        .args(["pick", "--borrow", "owner"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"owner (owner@x)\n");
-    assert!(!f.temp.path().join("args").exists());
-    let output = f
-        .command()
-        .env("CS_SSH", &ssh)
-        .env("BAD_RESPONSE", "yes")
-        .args(["pick", "--borrow", "owner"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("test-access-aaa"));
-}
-
-#[test]
 fn borrowed_run_releases_after_sigterm() {
     let f = Fixture::new();
     let ssh = f.bin.join("ssh");
@@ -1702,4 +1655,472 @@ fn lend_without_saved_accounts_has_no_grant() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("saved-refresh"));
+}
+
+// ---- borrow: lender, cache, t3 exec path -------------------------------------------------
+
+/// An owner machine with two saved subscription accounts, `oa` and `ob`. `ob` has no refresh
+/// token, so renewing it can only fail, and it is the one routing prefers (lower usage).
+fn owner_fixture(ob_expires_in: i64) -> Fixture {
+    let o = Fixture::new();
+    let now = chrono::Utc::now().timestamp();
+    let account = |alias: &str, expires_in: i64, refresh: bool| {
+        let mut oauth = json!({"accessToken":format!("{alias}-access"),"expiresAt":(now + expires_in) * 1000,"scopes":["user:inference"],"subscriptionType":"max"});
+        if refresh {
+            oauth["refreshToken"] = json!(format!("{alias}-refresh"));
+        }
+        json!({"email":format!("{alias}@x"),"data":{"claudeAiOauth":oauth,"oauthAccount":{"emailAddress":format!("{alias}@x"),"accountUuid":format!("{alias}-uuid")}}})
+    };
+    let state = json!({"providers":{"claude":{"current":"oa","accounts":{
+        "oa":account("oa", 7200, true),"ob":account("ob", ob_expires_in, false)}}}});
+    fs::write(o.data.join("cs/state.json"), state.to_string()).unwrap();
+    let reading = |five: f64| json!({"reading":{"status":"known","five_hour":{"utilization":five,"resets_at":null}},"fetched_at":now});
+    fs::write(
+        o.data.join("cs/usage.json"),
+        json!({"observed_at":now,"accounts":{"oa":reading(50.0),"ob":reading(1.0)}}).to_string(),
+    )
+    .unwrap();
+    o
+}
+
+fn script(path: &std::path::Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A CS_SSH stub that runs the remote command against the owner fixture and logs each call.
+fn owner_ssh(borrower: &Fixture, owner: &Fixture) -> PathBuf {
+    let cs_dir = borrower.temp.path().join("owner-bin");
+    fs::create_dir_all(&cs_dir).unwrap();
+    let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cs"), cs_dir.join("cs"));
+    let ssh = borrower.temp.path().join("ssh-owner");
+    script(
+        &ssh,
+        &format!(
+            r#"echo "$*" >> "{log}"
+eval "cmd=\${{$#}}"
+exec env -u CS_BORROW -u CS_SSH -u CS_BORROW_JUMP HOME="{home}" XDG_DATA_HOME="{data}" XDG_CONFIG_HOME="{cfg}" CLAUDE_CONFIG_DIR="{src}" CS_NATIVE_SOURCE_CONFIG="{src}" PATH="{bin}:/usr/bin:/bin" sh -c "$cmd" 2>> "{log}.err"
+"#,
+            log = ssh_log(borrower).display(),
+            home = owner.temp.path().display(),
+            data = owner.data.display(),
+            cfg = owner.temp.path().join("config").display(),
+            src = owner.source.display(),
+            bin = cs_dir.display(),
+        ),
+    );
+    ssh
+}
+
+fn ssh_log(f: &Fixture) -> PathBuf {
+    f.temp.path().join("ssh.log")
+}
+
+fn ssh_calls(f: &Fixture, needle: &str) -> usize {
+    fs::read_to_string(ssh_log(f))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
+/// A CS_SSH stub that must not be needed: it logs, then fails or hangs.
+fn broken_ssh(f: &Fixture, hang: bool) -> PathBuf {
+    let ssh = f.temp.path().join("ssh-broken");
+    script(
+        &ssh,
+        &format!(
+            "echo \"$*\" >> \"{}\"\n{}\n",
+            ssh_log(f).display(),
+            if hang { "exec sleep 30" } else { "exit 1" }
+        ),
+    );
+    ssh
+}
+
+fn borrow_cache(f: &Fixture) -> PathBuf {
+    f.data.join("cs/borrow/owner.json")
+}
+
+fn refresh_cache(f: &Fixture, ssh: &std::path::Path) {
+    let output = f
+        .command()
+        .env("CS_SSH", ssh)
+        .args(["borrow", "refresh", "--from", "owner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lend_renews_only_the_selected_alias_and_ignores_unrenewable_others() {
+    let o = owner_fixture(-3600);
+    let before = fs::read(o.data.join("cs/state.json")).unwrap();
+    let output = o
+        .command()
+        .args(["lend", "--alias", "oa", "--no-lease"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    let grant: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(grant["alias"], "oa");
+    assert_eq!(grant["email"], "oa@x");
+    assert!(grant.get("refresh_token").is_none() && grant.get("refreshToken").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("oa-refresh"));
+    assert!(!err.contains("oa-access") && !err.contains("oa-refresh"));
+    assert_eq!(before, fs::read(o.data.join("cs/state.json")).unwrap());
+    assert!(o.registry_opt().is_none_or(|r| r["leases"]
+        .as_object()
+        .is_none_or(|leases| leases.is_empty())));
+
+    let output = o
+        .command()
+        .args(["lend", "--alias", "ob", "--no-lease"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success() && output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("ob-access"));
+}
+
+#[test]
+fn bare_lend_skips_the_preferred_account_when_only_it_cannot_be_lent() {
+    let o = owner_fixture(-3600);
+    let output = o.command().arg("lend").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let grant: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(grant["alias"], "oa");
+    assert!(!grant["lease_id"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn lend_inventory_lists_aliases_and_usage_without_credentials() {
+    let o = owner_fixture(3600);
+    let output = o.command().args(["lend", "--inventory"]).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for secret in ["access", "refresh", "oa-uuid"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let inventory: Value = serde_json::from_str(&text).unwrap();
+    let accounts = inventory["accounts"].as_array().unwrap();
+    let aliases: Vec<_> = accounts
+        .iter()
+        .map(|a| a["alias"].as_str().unwrap())
+        .collect();
+    assert_eq!(aliases, ["oa", "ob"]);
+    assert_eq!(accounts[1]["email"], "ob@x");
+    assert!(accounts[1]["expires_at"].as_i64().unwrap() > chrono::Utc::now().timestamp());
+    assert_eq!(accounts[1]["usage"]["five_hour"]["utilization"], 1.0);
+}
+
+#[test]
+fn borrow_refresh_caches_access_only_grants_with_private_modes() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    let ssh = owner_ssh(&f, &o);
+    let output = f
+        .command()
+        .env("CS_SSH", &ssh)
+        .args(["borrow", "refresh", "--from", "owner"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{stderr} / {:?}",
+        fs::read_to_string(format!("{}.err", ssh_log(&f).display()))
+    );
+    assert!(stdout.contains("oa") && stdout.contains("ob"));
+    for text in [stdout.as_ref(), stderr.as_ref()] {
+        assert!(!text.contains("-access") && !text.contains("-refresh"));
+    }
+    let cache = borrow_cache(&f);
+    let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&cache), 0o600);
+    assert_eq!(mode(cache.parent().unwrap()), 0o700);
+    let text = fs::read_to_string(&cache).unwrap();
+    assert!(text.contains("oa-access") && text.contains("ob-access"));
+    assert!(!text.to_lowercase().contains("refresh"), "{text}");
+    assert_eq!(ssh_calls(&f, "--inventory"), 1);
+    assert_eq!(ssh_calls(&f, "lend --alias"), 2);
+    assert!(o.registry_opt().is_none_or(|r| r["leases"]
+        .as_object()
+        .is_none_or(|leases| leases.is_empty())));
+
+    refresh_cache(&f, &ssh);
+    assert_eq!(
+        ssh_calls(&f, "lend --alias"),
+        2,
+        "warm tokens are not re-lent"
+    );
+}
+
+#[test]
+fn borrow_refresh_relends_only_aliases_that_are_missing_or_near_expiry() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    let ssh = owner_ssh(&f, &o);
+    refresh_cache(&f, &ssh);
+    let mut cache: Value = serde_json::from_slice(&fs::read(borrow_cache(&f)).unwrap()).unwrap();
+    cache["entries"]["ob"]["expires_at"] = json!(chrono::Utc::now().timestamp() + 60);
+    fs::write(borrow_cache(&f), cache.to_string()).unwrap();
+    refresh_cache(&f, &ssh);
+    assert_eq!(ssh_calls(&f, "lend --alias 'ob'"), 2);
+    assert_eq!(ssh_calls(&f, "lend --alias 'oa'"), 1);
+}
+
+#[test]
+fn borrow_refresh_nests_the_jump_host_and_validates_hosts() {
+    let f = Fixture::new();
+    let ssh = broken_ssh(&f, false);
+    for (args, env) in [(vec!["--via", "hop"], None), (vec![], Some("hop"))] {
+        let _ = fs::remove_file(ssh_log(&f));
+        let mut command = f.command();
+        command
+            .env("CS_SSH", &ssh)
+            .args(["borrow", "refresh", "--from", "owner"])
+            .args(args);
+        if let Some(hop) = env {
+            command.env("CS_BORROW_JUMP", hop);
+        }
+        assert!(!command.output().unwrap().status.success());
+        let log = fs::read_to_string(ssh_log(&f)).unwrap();
+        assert!(
+            log.contains("ControlPath=none hop ssh -o BatchMode=yes -o ControlPath=none owner "),
+            "{log}"
+        );
+        assert!(log.contains("--inventory"));
+    }
+    let _ = fs::remove_file(ssh_log(&f));
+    f.command()
+        .env("CS_SSH", &ssh)
+        .args(["borrow", "refresh", "--from", "owner"])
+        .output()
+        .unwrap();
+    let log = fs::read_to_string(ssh_log(&f)).unwrap();
+    assert!(log.contains("ControlPath=none owner export PATH"), "{log}");
+    for bad in ["-oProxyCommand=x", "a b", "", ".."] {
+        let output = f
+            .command()
+            .env("CS_SSH", &ssh)
+            .args(["borrow", "refresh", "--from", bad])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{bad:?} accepted");
+    }
+    assert!(!f
+        .command()
+        .env("CS_SSH", &ssh)
+        .args([
+            "borrow",
+            "refresh",
+            "--from",
+            "owner",
+            "--via",
+            "-oProxyCommand=x"
+        ])
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn spawn_t3(f: &Fixture, ssh: &std::path::Path, wait: bool) -> std::process::Child {
+    let mut command = f.command();
+    command
+        .env("CS_SSH", ssh)
+        .env("CS_BORROW", "owner")
+        .arg("t3-claude")
+        .args(["--output-format", "stream-json", "--verbose"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if wait {
+        command.env("TEST_WAIT", "yes");
+    }
+    command.spawn().unwrap()
+}
+
+#[test]
+fn warm_cache_t3_spawn_execs_claude_without_touching_ssh_and_rotates() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    refresh_cache(&f, &owner_ssh(&f, &o));
+    let calls = ssh_calls(&f, "");
+    let broken = broken_ssh(&f, true);
+    let mut used = Vec::new();
+    for _ in 0..2 {
+        let _ = fs::remove_file(f.temp.path().join("child.pid"));
+        let started = Instant::now();
+        let mut child = spawn_t3(&f, &broken, true);
+        wait_for(&f.temp.path().join("child.pid"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = fs::read_to_string(f.temp.path().join("child.pid")).unwrap();
+        assert_eq!(
+            pid.trim(),
+            child.id().to_string(),
+            "Claude is the spawned pid"
+        );
+        let profile = PathBuf::from(
+            fs::read_to_string(f.temp.path().join("args.profile"))
+                .unwrap()
+                .trim(),
+        );
+        assert!(profile.starts_with(f.data.join("cs/borrow/profiles/owner")));
+        let config: Value =
+            serde_json::from_slice(&fs::read(profile.join(".claude.json")).unwrap()).unwrap();
+        used.push(
+            config["oauthAccount"]["emailAddress"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let credentials = fs::read_to_string(profile.join(".credentials.json")).unwrap();
+        let oauth: Value = serde_json::from_str(&credentials).unwrap();
+        assert!(oauth["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .unwrap()
+            .ends_with("-access"));
+        assert!(oauth["claudeAiOauth"].get("refreshToken").is_none());
+        assert!(
+            oauth["claudeAiOauth"]["expiresAt"].as_i64().unwrap()
+                > chrono::Utc::now().timestamp_millis()
+        );
+        assert_eq!(oauth["claudeAiOauth"]["subscriptionType"], "max");
+        assert!(f
+            .registry_opt()
+            .is_none_or(|r| r["leases"].as_object().is_none_or(|l| l.is_empty())));
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let mut stderr = String::new();
+        use std::io::Read;
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        child.wait().unwrap();
+        assert!(!stderr.contains("-access") && !stderr.contains("-refresh"));
+    }
+    used.sort();
+    assert_eq!(
+        used,
+        ["oa@x", "ob@x"],
+        "consecutive spawns rotate across the cache"
+    );
+    assert_eq!(ssh_calls(&f, ""), calls, "warm spawns never run ssh");
+}
+
+#[test]
+fn cold_cache_concurrent_t3_spawns_share_one_refresh() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    let ssh = owner_ssh(&f, &o);
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            let mut command = f.command();
+            command
+                .env("CS_SSH", &ssh)
+                .env("CS_BORROW", "owner")
+                .args(["t3-claude", "--version"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            command.spawn().unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(ssh_calls(&f, "--inventory"), 1);
+    assert!(borrow_cache(&f).exists());
+}
+
+#[test]
+fn failing_or_hung_refresh_falls_back_to_the_local_login_and_backs_off() {
+    for hang in [false, true] {
+        let f = Fixture::new();
+        let ssh = broken_ssh(&f, hang);
+        let run = || {
+            let started = Instant::now();
+            let output = f
+                .command()
+                .env("CS_SSH", &ssh)
+                .env("CS_BORROW", "owner")
+                .env("CS_BORROW_TIMEOUT_SECS", "1")
+                .args(["t3-claude", "--version"])
+                .output()
+                .unwrap();
+            (output, started.elapsed())
+        };
+        let (output, took) = run();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{err}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        assert!(
+            err.contains("borrow") && err.contains("falling back"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(f.temp.path().join("args"))
+                .unwrap()
+                .lines()
+                .next(),
+            Some("--version")
+        );
+        let profile = fs::read_to_string(f.temp.path().join("args.profile")).unwrap();
+        assert!(
+            profile.trim().ends_with("/profiles/61"),
+            "local account profile: {profile}"
+        );
+        assert_eq!(ssh_calls(&f, "--inventory"), 1);
+        let (output, _) = run();
+        assert!(output.status.success());
+        assert_eq!(
+            ssh_calls(&f, "--inventory"),
+            1,
+            "recent failure suppresses retries"
+        );
+    }
+}
+
+#[test]
+fn borrow_pick_names_a_cached_account_and_reports_bad_responses_safely() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    refresh_cache(&f, &owner_ssh(&f, &o));
+    let output = f
+        .command()
+        .env("CS_SSH", broken_ssh(&f, false))
+        .args(["pick", "--borrow", "owner"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(line == "oa (oa@x)\n" || line == "ob (ob@x)\n", "{line}");
+
+    let f = Fixture::new();
+    let bad = f.temp.path().join("ssh-bad");
+    script(&bad, "echo 'test-access-aaa not json'\n");
+    let output = f
+        .command()
+        .env("CS_SSH", &bad)
+        .args(["borrow", "refresh", "--from", "owner"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("test-access-aaa"));
+    assert!(!borrow_cache(&f).exists());
 }

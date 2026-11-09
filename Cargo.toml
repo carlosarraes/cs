@@ -1,6 +1,6 @@
 [package]
 name = "cs"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 description = "Route Claude Code sessions across accounts and track API-key spend"
 license = "MIT"

@@ -149,9 +149,17 @@ token is kept and a fresher one is imported into the saved account. Missing or s
 falls back to a local valid subscription account (no network); fresh usage that is over
 ceiling still fails until `cs usage --live` or the `cs start` daemon refreshes it.
 
-Borrow: cs run --borrow HOST -- <claude args>; cs pick --borrow HOST.
-cs t3-claude and cs-t3-claude reject --borrow and CS_BORROW (borrow stays out of t3 for now).
-CS_BORROW sets the default host for cs run and cs pick.
-CLI --borrow overrides the environment and conflicts with --account.
-Owner SSH commands: cs lend emits an access-only JSON grant; cs lend-release LEASE_ID
-releases its durable lease. Refresh credentials remain on the owner.
+Borrow: cs run --borrow HOST -- <claude args> does a live one-shot lend over ssh and supervises.
+t3 (cs t3-claude, cs-t3-claude, CS_BORROW=HOST) never uses ssh while spawning: it picks the
+least recently used unexpired grant from the local cache (state dir borrow/HOST.json, 0600,
+access tokens only), writes it into a stable per-host-alias profile and execs Claude.
+Keep the cache warm with: cs borrow refresh --from HOST [--via JUMP] (CS_BORROW_JUMP also
+sets the jump; the hop is ssh JUMP ssh HOST). Only missing or near-expiry aliases are lent.
+A cold cache triggers one single-flight refresh (<=15s, CS_BORROW_TIMEOUT_SECS lowers it);
+on failure t3 warns and execs with the local login, then skips the network for 60s.
+cs pick --borrow HOST names the cached account without launching. CLI --borrow overrides the
+environment and conflicts with --account.
+Owner commands: cs lend [--alias NAME] emits one access-only JSON grant and renews only that
+account; cs lend --inventory lists aliases, expiry and usage with no credentials;
+--no-lease skips the owner lease; cs lend-release LEASE_ID releases a durable lease.
+Refresh credentials remain on the owner.

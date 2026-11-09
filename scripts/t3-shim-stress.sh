@@ -14,6 +14,11 @@
 # process's stdin pipe open until the check, so a Claude that outlives its shim is counted
 # instead of quietly exiting on EOF. After the cycles it waits up to REAP_SECS (default 15,
 # the watcher sleeps 5s before its group SIGKILL) for stragglers to disappear, then compares.
+# Borrow: unless CS_STRESS_BORROW=0, half of the cycles also run with CS_BORROW=owner against a
+# fake lend (a CS_SSH stub answering `lend --inventory` and `lend --alias X --no-lease` for two
+# throwaway accounts). The cache is warmed once with `cs borrow refresh` before the cycles; the
+# run then fails if any ssh is started afterwards (the spawn path must never use the network)
+# or if the borrowed path was never exercised.
 # On macOS the cs profile credentials live in the Keychain, so set CS_STRESS_ALLOW_KEYCHAIN=1
 # to accept that fake items are created for the throwaway profile paths.
 set -euo pipefail
@@ -29,7 +34,7 @@ if [[ "$(uname)" == Darwin && -z "${CS_STRESS_ALLOW_KEYCHAIN:-}" ]]; then
     echo "error: set CS_STRESS_ALLOW_KEYCHAIN=1 to run on macOS (see header)" >&2
     exit 2
 fi
-export CS_BIN CYCLES="${CYCLES:-200}" CONCURRENCY="${CONCURRENCY:-6}" SEED="${SEED:-1}" REAP_SECS="${REAP_SECS:-15}"
+export CS_BIN CS_STRESS_BORROW="${CS_STRESS_BORROW:-1}" CYCLES="${CYCLES:-200}" CONCURRENCY="${CONCURRENCY:-6}" SEED="${SEED:-1}" REAP_SECS="${REAP_SECS:-15}"
 
 exec python3 -I - <<'PY'
 import json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time
@@ -59,6 +64,32 @@ data, source = os.path.join(tmp, "data"), os.path.join(tmp, "claude")
 for d in (os.path.join(data, "cs"), source, os.path.join(tmp, "home")):
     os.makedirs(d, exist_ok=True)
 
+BORROW = os.environ["CS_STRESS_BORROW"] != "0"
+ssh_log = os.path.join(tmp, "ssh.log")
+fake_ssh = os.path.join(bin_dir, "fake-ssh")
+if BORROW:
+    exp = int(time.time()) + 7200
+    replies = {"inv": {"accounts": [{"alias": a, "email": f"{a}@x", "expires_at": exp, "usage": None} for a in ("ba", "bb")]}}
+    for a in ("ba", "bb"):
+        replies[a] = {"alias": a, "email": f"{a}@x", "lease_id": "", "expires_at": exp, "access_token": f"{a}-access",
+                      "oauth_meta": {"scopes": ["user:inference"], "subscriptionType": "max"},
+                      "identity": {"emailAddress": f"{a}@x"}}
+    for name, reply in replies.items():
+        with open(os.path.join(tmp, f"reply-{name}.json"), "w") as f:
+            json.dump(reply, f)
+    with open(fake_ssh, "w") as f:
+        f.write(f"""#!/bin/sh
+echo "$*" >> '{ssh_log}'
+eval "cmd=\\${{$#}}"
+case "$cmd" in
+  *'lend --inventory'*) cat '{tmp}/reply-inv.json';;
+  *"lend --alias 'ba' "*) cat '{tmp}/reply-ba.json';;
+  *"lend --alias 'bb' "*) cat '{tmp}/reply-bb.json';;
+  *) exit 1;;
+esac
+""")
+    os.chmod(fake_ssh, 0o755)
+
 def write_usage():
     now = int(time.time())
     reading = {"reading": {"status": "known", "five_hour": {"utilization": 0, "resets_at": None}}, "fetched_at": now}
@@ -86,6 +117,11 @@ env.update(HOME=os.path.join(tmp, "home"), XDG_DATA_HOME=data, XDG_CONFIG_HOME=o
            CLAUDE_CONFIG_DIR=source, CS_NATIVE_SOURCE_CONFIG=source,
            PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
 
+borrow_env = dict(env, CS_BORROW="owner", CS_SSH=fake_ssh)
+
+def pick_env(rng):
+    return borrow_env if BORROW and rng.random() < 0.5 else env
+
 def table():
     out = subprocess.run(["ps", "-axo", "pid=,ppid=,stat=,command="], capture_output=True, text=True).stdout
     rows = []
@@ -97,19 +133,36 @@ def table():
 
 def counts():
     me = os.getpid()
-    c = dict(shim=0, claude=0, maintain=0, zombie=0)
+    c = dict(shim=0, claude=0, maintain=0, zombie=0, ssh=0)
     for pid, stat, cmd in table():
         if stat.startswith("Z"):
             c["zombie"] += 1
         if pid == me or " ps " in f" {cmd} " or cmd.startswith("ps "):
             continue
-        if f"{fake}" in cmd:
+        if fake_ssh in cmd:
+            c["ssh"] += 1
+        elif f"{fake}" in cmd:
             c["claude"] += 1
         elif "native-maintain" in cmd:
             c["maintain"] += 1
         elif "cs-t3-claude" in cmd or " t3-claude" in cmd:
             c["shim"] += 1
     return c
+
+def ssh_calls():
+    try:
+        with open(ssh_log) as f:
+            return len(f.read().splitlines())
+    except FileNotFoundError:
+        return 0
+
+if BORROW:
+    warm = subprocess.run([CS, "borrow", "refresh", "--from", "owner"], env=borrow_env, cwd=tmp,
+                          capture_output=True, text=True, timeout=60)
+    if warm.returncode != 0 or "-access" in warm.stdout + warm.stderr:
+        print("FAIL: borrow refresh warm-up:", warm.returncode, warm.stderr.strip()[:200])
+        sys.exit(1)
+warm_ssh_calls = ssh_calls()
 
 before = counts()
 load_before = os.getloadavg()[0]
@@ -135,8 +188,8 @@ def hold(p):
 def fail(kind, message):
     errors.append(f"{kind}: {message}")
 
-def spawn(argv, **kw):
-    return subprocess.Popen(argv, env=env, cwd=tmp, **kw)
+def spawn(argv, e, **kw):
+    return subprocess.Popen(argv, env=e, cwd=tmp, **kw)
 
 def shim_argv(rng, args):
     return [shim, *args] if rng.random() < 0.7 else [CS, "t3-claude", *args]
@@ -154,13 +207,13 @@ def first_line(proc, kind):
     return line
 
 def cycle_version(rng):
-    out = subprocess.run(shim_argv(rng, ["--version"]), env=env, cwd=tmp, stdin=subprocess.DEVNULL,
+    out = subprocess.run(shim_argv(rng, ["--version"]), env=pick_env(rng), cwd=tmp, stdin=subprocess.DEVNULL,
                          capture_output=True, text=True, timeout=30)
     if out.returncode != 0 or "Claude Code" not in out.stdout:
         fail("version", f"rc={out.returncode} stderr={out.stderr.strip()[:200]}")
 
 def cycle_session(rng):
-    p = spawn(shim_argv(rng, STREAM), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = spawn(shim_argv(rng, STREAM), pick_env(rng), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     first_line(p, "session")
     p.stdin.close()
     if wait_exit(p, 10) != 0:
@@ -168,7 +221,7 @@ def cycle_session(rng):
         p.kill(); p.wait()
 
 def cycle_abort(rng):
-    p = spawn(shim_argv(rng, STREAM), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = spawn(shim_argv(rng, STREAM), pick_env(rng), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     time.sleep(rng.uniform(0, 0.15))
     p.send_signal(signal.SIGTERM)
     if wait_exit(p, 5) is None:
@@ -176,7 +229,7 @@ def cycle_abort(rng):
     hold(p)
 
 def cycle_kill(rng):
-    p = spawn(shim_argv(rng, STREAM), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = spawn(shim_argv(rng, STREAM), pick_env(rng), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     time.sleep(rng.uniform(0, 0.05))
     p.kill(); p.wait()
     hold(p)
@@ -187,7 +240,7 @@ def wrapper_cycle(rng, kind, kill_group_on_exit):
         os.setsid()
         os.dup2(r, 3)
         os.set_inheritable(3, True)
-    p = spawn(["/bin/sh", "-c", WATCH, "t3-claude", *shim_argv(rng, STREAM)], stdin=subprocess.PIPE,
+    p = spawn(["/bin/sh", "-c", WATCH, "t3-claude", *shim_argv(rng, STREAM)], pick_env(rng), stdin=subprocess.PIPE,
               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=False, preexec_fn=child_setup)
     os.close(r)
     first_line(p, kind)
@@ -209,7 +262,7 @@ def cycle_wrapper_watcher_only(rng):
     wrapper_cycle(rng, "wrapper-watcher", False)
 
 def cycle_group_kill(rng):
-    p = spawn(shim_argv(rng, STREAM), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    p = spawn(shim_argv(rng, STREAM), pick_env(rng), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
               stderr=subprocess.DEVNULL, start_new_session=True)
     time.sleep(rng.uniform(0, 0.1))
     try:
@@ -245,9 +298,21 @@ stop.set()
 for p in held:
     p.stdin.close(); p.stdout.close()
 leftover = {k: after[k] - before[k] for k in after if after[k] > before[k]}
+if BORROW:
+    if ssh_calls() != warm_ssh_calls:
+        fail("borrow", f"ssh ran on the spawn path ({ssh_calls() - warm_ssh_calls} extra calls)")
+    try:
+        with open(os.path.join(data, "cs", "borrow", "owner.json")) as f:
+            used = sum(1 for e in json.load(f)["entries"].values() if e.get("last_used"))
+        if not used:
+            fail("borrow", "no borrowed grant was ever picked")
+    except (OSError, ValueError, KeyError) as error:
+        fail("borrow", f"cache unreadable: {error!r}")
 
-print(f"cycles={CYCLES} concurrency={CONCURRENCY} seed={SEED} elapsed={elapsed:.1f}s")
+print(f"cycles={CYCLES} concurrency={CONCURRENCY} seed={SEED} borrow={int(BORROW)} elapsed={elapsed:.1f}s")
 print(f"before: {before}")
+if BORROW:
+    print(f"ssh calls: warm-up={warm_ssh_calls} total={ssh_calls()}")
 print(f"after:  {after}")
 print(f"load1: before={load_before:.2f} peak={peak['load']:.2f} after={os.getloadavg()[0]:.2f}; "
       f"peak live shim/claude/maintain processes={peak['procs']}")

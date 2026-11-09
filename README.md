@@ -425,9 +425,18 @@ Honors `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 
 Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.
 
-Borrow owner-routed subscription access with `cs run --borrow owner`,
-`cs t3-claude --borrow owner`, or `cs pick --borrow owner`.
-`CS_BORROW=owner` also works with the t3 shim; the CLI host takes precedence.
-The owner provides `cs lend` and idempotent `cs lend-release <lease_id>` over SSH.
-Only the access token reaches the child process; refresh credentials stay on the owner.
-Remote leases expire with the grant and are released when the child exits.
+Borrow another machine's subscription accounts with `cs run --borrow owner` (live one-shot
+lend over SSH) or, for t3, `CS_BORROW=owner` / `cs t3-claude --borrow owner`. The owner keeps
+the real logins and refresh tokens and lends short-lived access tokens: `cs lend --alias NAME`
+renews only the lent account, and `cs lend --inventory` lists lendable aliases and usage
+without credentials. Accounts added on the owner appear after the next refresh.
+
+The t3 shim never uses SSH while spawning. It picks the least recently used unexpired grant from
+`borrow/<host>.json` in the cs state directory (mode 0600, access tokens only), writes it into a
+stable per-host-alias profile and replaces itself with Claude. Warm the cache with
+`cs borrow refresh --from owner [--via jump]` (`CS_BORROW_JUMP=jump` also works when the owner is
+only reachable as `ssh jump ssh owner`). A cold cache does one locked refresh of at most 15
+seconds; if that fails the shim warns and uses the local login. No timers are installed, so run
+the refresh from your own scheduler. `cs pick --borrow owner` names a cached account.
+Access tokens cannot be renewed on the borrower: a session that outlives its token needs a
+restart to pick up a fresh one. `cs run --borrow` leases are released when the child exits.

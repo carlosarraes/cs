@@ -302,6 +302,41 @@ pub fn prepare_exec(alias: &str, account: &state::Account, source: &Path) -> Res
     Ok(profile)
 }
 
+/// Prepare the stable profile for a borrowed grant. Only the access token is written, never a
+/// refresh grant, and a still-valid token already in the profile is kept if it is not older.
+pub fn prepare_borrowed(
+    profile: &Path,
+    email: &str,
+    identity: &Value,
+    oauth: &Value,
+    source: &Path,
+) -> Result<()> {
+    let _credentials = crate::accounts::credential_lock()?;
+    let identity = if identity["emailAddress"].as_str() == Some(email) {
+        identity.clone()
+    } else {
+        json!({"emailAddress": email})
+    };
+    let account = state::Account {
+        kind: None,
+        email: email.to_owned(),
+        data: json!({"oauthAccount": identity}),
+    };
+    let source_global = if source == util::home()?.join(".claude") {
+        util::home()?.join(".claude.json")
+    } else {
+        source.join(".claude.json")
+    };
+    prepare_files(profile, source, &read_json(&source_global)?, &account)?;
+    let now_ms = crate::usage::now().saturating_mul(1000);
+    if let Some(existing) = crate::claude::read_profile_oauth(profile)? {
+        if oauth_valid(&existing, now_ms) && expires_at(&existing) >= expires_at(oauth) {
+            return Ok(());
+        }
+    }
+    crate::claude::write_profile_oauth(profile, &access_credentials(oauth))
+}
+
 fn expires_at(oauth: &Value) -> i64 {
     oauth["expiresAt"].as_i64().unwrap_or(0)
 }

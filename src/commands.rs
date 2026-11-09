@@ -580,6 +580,11 @@ pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, 
 }
 
 pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
+    renew_native_account_within(alias, email, REFRESH_MARGIN_MS)
+}
+
+/// Renew only when the saved access token expires within `margin_ms`.
+pub fn renew_native_account_within(alias: &str, email: &str, margin_ms: i64) -> Result<()> {
     let _credentials = crate::accounts::credential_lock()?;
     let initial = State::load()?;
     let account = initial
@@ -596,7 +601,7 @@ pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
         ));
     }
     let now_ms = usage::now() * 1000;
-    if saved_expires_at(&account.data).is_none_or(|time| time > now_ms + REFRESH_MARGIN_MS) {
+    if saved_expires_at(&account.data).is_none_or(|time| time > now_ms + margin_ms) {
         return Ok(());
     }
     let live = renewal_login(

@@ -1,5 +1,6 @@
 mod accounts;
 mod borrow;
+mod borrow_cache;
 mod claude;
 mod commands;
 mod config;
@@ -54,9 +55,25 @@ enum Commands {
         #[arg(long)]
         borrow: Option<String>,
     },
-    Lend,
+    /// Owner side of borrowing: print one access-only grant (renews only that account)
+    Lend {
+        /// Lend this alias instead of the router's choice
+        #[arg(long, conflicts_with = "inventory")]
+        alias: Option<String>,
+        /// List lendable aliases with expiry and usage; no credentials
+        #[arg(long)]
+        inventory: bool,
+        /// Skip the owner-side lease; the borrower caches the token instead
+        #[arg(long, conflicts_with = "inventory")]
+        no_lease: bool,
+    },
     LendRelease {
         lease_id: String,
+    },
+    /// Borrow access tokens from another machine for t3 and cs run
+    Borrow {
+        #[command(subcommand)]
+        command: BorrowCommands,
     },
     /// Save an Anthropic API key from masked stdin
     AddKey {
@@ -175,6 +192,19 @@ cannot change accounts again; start a new conversation for another account.")]
 }
 
 #[derive(Subcommand)]
+enum BorrowCommands {
+    /// Fetch access tokens for every owner account that is missing or near expiry
+    Refresh {
+        /// Owner host (defaults to CS_BORROW)
+        #[arg(long)]
+        from: Option<String>,
+        /// Jump host to reach the owner through (defaults to CS_BORROW_JUMP)
+        #[arg(long)]
+        via: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCommands {
     /// List snapshots, or the sessions inside one
     List {
@@ -236,7 +266,14 @@ fn main() -> Result<()> {
             true,
             false,
         ),
-        Commands::Lend => borrow::lend(),
+        Commands::Lend {
+            alias,
+            inventory,
+            no_lease,
+        } => borrow::lend(alias.as_deref(), inventory, no_lease),
+        Commands::Borrow {
+            command: BorrowCommands::Refresh { from, via },
+        } => borrow_cache::refresh_command(from.as_deref(), via.as_deref()),
         Commands::LendRelease { lease_id } => borrow::release(&lease_id),
         Commands::AddKey { alias } => commands::add_key(&alias),
         Commands::Add {
