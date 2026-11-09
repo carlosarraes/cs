@@ -882,6 +882,61 @@ fn has_routable_account(
     .is_some()
 }
 
+/// When every valid subscription token lacks fresh usage, pick one locally instead of
+/// failing the t3 probe. Fresh readings that are over ceiling still fail inside reserve.
+fn t3_stale_usage_fallback(
+    accounts: &state::State,
+    observation: &crate::usage::Observation,
+    cfg: &crate::config::Routing,
+) -> Option<String> {
+    if has_routable_account(accounts, observation, cfg) {
+        return None;
+    }
+    let now = crate::usage::now();
+    let max_age = cfg.max_usage_age_secs as i64;
+    let mut valid: Vec<&String> = accounts
+        .claude()
+        .accounts
+        .iter()
+        .filter(|(_, account)| crate::routing::store::token_valid(account, now))
+        .map(|(alias, _)| alias)
+        .collect();
+    if valid.is_empty() {
+        return None;
+    }
+    let fresh = |alias: &str| {
+        observation
+            .accounts
+            .get(alias)
+            .and_then(|entry| entry.fetched_at)
+            .is_some_and(|fetched| {
+                now.checked_sub(fetched)
+                    .is_some_and(|age| (0..=max_age).contains(&age))
+            })
+    };
+    if valid.iter().any(|alias| fresh(alias)) {
+        return None;
+    }
+    valid.retain(|alias| {
+        !observation
+            .accounts
+            .get(*alias)
+            .and_then(|entry| entry.reading.known())
+            .is_some_and(|usage| {
+                usage
+                    .five_hour
+                    .as_ref()
+                    .is_some_and(|window| window.utilization >= 100.)
+                    || usage
+                        .seven_day
+                        .as_ref()
+                        .is_some_and(|window| window.utilization >= 100.)
+            })
+    });
+    valid.sort();
+    valid.into_iter().next().cloned()
+}
+
 /// t3 tracks and kills the pid it spawned and expects it to be Claude itself, so this path
 /// picks an account from local state only and replaces this process with Claude. No
 /// supervisor, credential renewal, or network access may live here.
@@ -894,8 +949,15 @@ fn t3_exec(args: Vec<OsString>, accounts: state::State) -> Result<()> {
     let store = Store::default_path()?;
     let token = store.register()?;
     let launch = (|| -> Result<(crate::native::NativeCommand, String, String)> {
-        let (account, alias) =
-            store.reserve_native(&token, &root, None, &accounts, &observation.accounts, &cfg)?;
+        let forced = t3_stale_usage_fallback(&accounts, &observation, &cfg);
+        let (account, alias) = store.reserve_native(
+            &token,
+            &root,
+            forced.as_deref(),
+            &accounts,
+            &observation.accounts,
+            &cfg,
+        )?;
         let profile = crate::native::prepare_exec(&alias, &account, &source)?;
         let mut command = crate::native::exec_command(&profile, args)?;
         command.env("CS_NATIVE_LEASE", &token);

@@ -1424,6 +1424,59 @@ fn t3_shim_passes_version_and_session_args_through_the_same_exec() {
 }
 
 #[test]
+fn t3_shim_execs_when_cached_usage_is_stale_or_missing() {
+    let stale = chrono::Utc::now().timestamp() - 301;
+    for usage in [
+        None,
+        Some(
+            json!({"observed_at":stale,"accounts":{"a":{"reading":{"status":"known","five_hour":{"utilization":10.0,"resets_at":null}},"fetched_at":stale}}}),
+        ),
+    ] {
+        let f = Fixture::new();
+        let path = f.data.join("cs/usage.json");
+        match &usage {
+            None => fs::remove_file(&path).unwrap(),
+            Some(value) => fs::write(&path, value.to_string()).unwrap(),
+        }
+        let output = f
+            .command()
+            .args(["t3-claude", "--version"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(f.temp.path().join("args"))
+                .unwrap()
+                .lines()
+                .next(),
+            Some("--version")
+        );
+    }
+}
+
+#[test]
+fn t3_shim_does_not_launch_when_fresh_usage_is_exhausted() {
+    let f = Fixture::new();
+    fs::write(f.data.join("cs/usage.json"),json!({"observed_at":chrono::Utc::now().timestamp(),"accounts":{"a":{"reading":{"status":"known","five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":100,"resets_at":null}},"fetched_at":chrono::Utc::now().timestamp()}}}).to_string()).unwrap();
+    let output = f
+        .command()
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("fresh usage") || err.contains("quota exhausted"),
+        "{err}"
+    );
+    assert!(!f.temp.path().join("args").exists());
+}
+
+#[test]
 fn t3_shim_rejects_borrow_without_touching_ssh_or_claude() {
     let f = Fixture::new();
     let ssh = f.bin.join("ssh");

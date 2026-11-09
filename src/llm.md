@@ -145,8 +145,9 @@ t3 tracks and kills the pid it spawns, so t3-claude picks an account from local 
 (no network, ssh, renewal, or usage polling), then execs claude; no wrapper stays alive,
 so there is no supervision, 30s credential renewal, or in-place switching for t3 sessions.
 Its pid is the lease; dead pids are reaped by the next routing update. A still-valid profile
-token is kept and a fresher one is imported into the saved account. Stale usage fails fast:
-refresh it with cs usage --live or the cs start daemon.
+token is kept and a fresher one is imported into the saved account. Missing or stale usage
+falls back to a local valid subscription account (no network); fresh usage that is over
+ceiling still fails until `cs usage --live` or the `cs start` daemon refreshes it.
 
 Borrow: cs run --borrow HOST -- <claude args>; cs pick --borrow HOST.
 cs t3-claude and cs-t3-claude reject --borrow and CS_BORROW (borrow stays out of t3 for now).
