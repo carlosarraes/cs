@@ -141,3 +141,9 @@ currently selected account. Utilities create no conversation or session count.
 Other arguments use normal quota admission; config is not a Claude subcommand.
 
 Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.
+
+Borrow: cs run --borrow HOST -- <claude args>; cs t3-claude --borrow HOST;
+cs pick --borrow HOST. CS_BORROW sets the default host, including cs-t3-claude.
+CLI --borrow overrides the environment and conflicts with --account.
+Owner SSH commands: cs lend emits an access-only JSON grant; cs lend-release LEASE_ID
+releases its durable lease. Refresh credentials remain on the owner.

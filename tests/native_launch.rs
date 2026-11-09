@@ -1362,3 +1362,168 @@ fn t3_pick_avoids_account_with_live_session() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"b (b@x)\n");
 }
+
+#[test]
+fn borrowed_launches_release_and_keep_grants_out_of_storage_and_errors() {
+    for exit in [0, 7, 143] {
+        let f = Fixture::new();
+        let ssh = f.bin.join("ssh");
+        fs::write(&ssh, r#"#!/bin/sh
+printf '%s\n' "$@" >> "$TEST_SIGNALS"
+case "$*" in
+ *lend-release*) exit 0;;
+esac
+printf '%s\n' '{"alias":"owner","email":"owner@x","lease_id":"same-lease","expires_at":9999999999,"access_token":"test-access-aaa"}'
+"#).unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            f.bin.join("claude"),
+            format!(
+                r#"#!/bin/sh
+[ "$CLAUDE_CODE_OAUTH_TOKEN" = test-access-aaa ] || exit 81
+printf '%s\n' "$@" > "$TEST_ARGS"
+echo CHILD
+exit {exit}
+"#
+            ),
+        )
+        .unwrap();
+        let before = fs::read(f.data.join("cs/state.json")).unwrap();
+        let output = f
+            .command()
+            .env("CS_SSH", &ssh)
+            .args([
+                "t3-claude",
+                "-p",
+                "--borrow=owner",
+                "--output-format",
+                "stream-json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        assert_eq!(output.stdout, b"CHILD\n");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(!err.contains("test-access-aaa") && !err.contains("test-refresh-bbb"));
+        assert!(err.contains("--borrow owner -> owner (owner@x)"));
+        assert_eq!(before, fs::read(f.data.join("cs/state.json")).unwrap());
+        let args = fs::read_to_string(f.temp.path().join("args")).unwrap();
+        assert!(!args.contains("--borrow"));
+        assert!(args.contains("stream-json"));
+        let ssh_args = fs::read_to_string(f.temp.path().join("signals")).unwrap();
+        assert!(ssh_args.contains("BatchMode=yes") && ssh_args.contains("ControlPath=none"));
+        assert!(ssh_args.contains("lend-release 'same-lease'"));
+    }
+}
+
+#[test]
+fn lend_is_durable_until_release() {
+    let f = Fixture::new();
+    let output = f.command().arg("lend").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let grant: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(grant.get("refresh_token").is_none());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!err.contains("saved-access") && !err.contains("saved-refresh"));
+    let id = grant["lease_id"].as_str().unwrap();
+    assert!(f.command().arg("pick").output().unwrap().status.success());
+    assert!(f.registry()["leases"].get(id).is_some());
+    assert!(f
+        .command()
+        .args(["lend-release", id])
+        .status()
+        .unwrap()
+        .success());
+    assert!(f.registry()["leases"].get(id).is_none());
+}
+
+#[test]
+fn borrow_pick_and_invalid_response_do_not_expose_tokens() {
+    let f = Fixture::new();
+    let ssh = f.bin.join("ssh");
+    fs::write(&ssh, r#"#!/bin/sh
+printf '%s\n' "$@" >> "$TEST_SIGNALS"
+case "$*" in *lend-release*) exit 0;; esac
+if [ "$BAD_RESPONSE" = yes ]; then echo 'test-access-aaa invalid'; exit 0; fi
+echo '{"alias":"owner","email":"owner@x","lease_id":"lease","expires_at":9999999999,"access_token":"test-access-aaa"}'
+"#).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = f
+        .command()
+        .env("CS_SSH", &ssh)
+        .env("CS_BORROW", "fallback")
+        .args(["pick", "--borrow", "owner"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"owner (owner@x)\n");
+    assert!(!f.temp.path().join("args").exists());
+    let output = f
+        .command()
+        .env("CS_SSH", &ssh)
+        .env("BAD_RESPONSE", "yes")
+        .args(["pick", "--borrow", "owner"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("test-access-aaa"));
+}
+
+#[test]
+fn borrowed_shim_releases_after_sigterm() {
+    let f = Fixture::new();
+    let ssh = f.bin.join("ssh");
+    fs::write(&ssh, r#"#!/bin/sh
+printf '%s\n' "$@" >> "$TEST_SIGNALS"
+case "$*" in *lend-release*) exit 0;; esac
+echo '{"alias":"owner","email":"owner@x","lease_id":"signal-lease","expires_at":9999999999,"access_token":"test-access-aaa"}'
+"#).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        f.bin.join("claude"),
+        r#"#!/bin/sh
+echo ready > "$TEST_CHILD_PID"
+while :; do sleep 0.1; done
+"#,
+    )
+    .unwrap();
+    let shim = f.bin.join("cs-t3-claude");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cs"), &shim).unwrap();
+    let mut command = f.command();
+    command.env("CS_SSH", &ssh).env("CS_BORROW", "owner");
+    use std::os::unix::process::CommandExt;
+    command.arg0("cs-t3-claude");
+    let mut child = command
+        .args(["-p", "--output-format", "stream-json"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.temp.path().join("child.pid").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
+    assert!(fs::read_to_string(f.temp.path().join("signals"))
+        .unwrap()
+        .contains("lend-release 'signal-lease'"));
+}
+
+#[test]
+fn lend_without_saved_accounts_has_no_grant() {
+    let f = Fixture::new();
+    fs::write(f.data.join("cs/state.json"), "{}").unwrap();
+    let output = f.command().arg("lend").output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("saved-refresh"));
+}

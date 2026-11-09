@@ -30,7 +30,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Assignments::default(),
             Err(e) => return Err(e.into()),
         };
-        data.leases.retain(|_, l| l.process.alive());
+        data.leases.retain(|_, l| l.alive());
         let roots: std::collections::BTreeSet<_> = data
             .leases
             .values()
@@ -52,6 +52,7 @@ impl Store {
             s.leases.insert(
                 token.clone(),
                 Lease {
+                    expires_at: None,
                     process,
                     root: None,
                 },
@@ -69,6 +70,7 @@ impl Store {
             s.leases.insert(
                 token.clone(),
                 Lease {
+                    expires_at: None,
                     process,
                     root: Some(root.clone()),
                 },

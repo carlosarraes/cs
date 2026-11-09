@@ -4,8 +4,18 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
+    #[serde(default)]
+    pub expires_at: Option<i64>,
     pub process: Process,
     pub root: Option<String>,
+}
+impl Lease {
+    pub fn alive(&self) -> bool {
+        self.expires_at.map_or_else(
+            || self.process.alive(),
+            |expiry| crate::usage::now() < expiry,
+        )
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
@@ -30,7 +40,7 @@ impl Assignments {
         let mut roots: std::collections::BTreeSet<_> = self
             .leases
             .values()
-            .filter(|l| l.process.alive())
+            .filter(|l| l.alive())
             .filter_map(|l| l.root.as_ref())
             .collect();
         roots.extend(
@@ -70,6 +80,7 @@ mod tests {
             s.leases.insert(
                 key.into(),
                 Lease {
+                    expires_at: None,
                     process: Process::current().unwrap(),
                     root: Some("root".into()),
                 },

@@ -1,4 +1,5 @@
 mod accounts;
+mod borrow;
 mod claude;
 mod commands;
 mod config;
@@ -49,9 +50,18 @@ enum Commands {
         args: Vec<std::ffi::OsString>,
     },
     /// Name the account automatic routing would select
-    Pick,
+    Pick {
+        #[arg(long)]
+        borrow: Option<String>,
+    },
+    Lend,
+    LendRelease {
+        lease_id: String,
+    },
     /// Save an Anthropic API key from masked stdin
-    AddKey { alias: String },
+    AddKey {
+        alias: String,
+    },
     /// Save an account under an alias, restoring the previously active login by default
     #[command(
         after_help = "By default, restore the previously selected login and preserve current/previous.
@@ -139,7 +149,10 @@ cannot change accounts again; start a new conversation for another account.")]
     #[command(hide = true)]
     NativeEvent,
     #[command(hide = true)]
-    NativeMaintain { alias: String, email: String },
+    NativeMaintain {
+        alias: String,
+        email: String,
+    },
     /// Show live conversation UUIDs, accounts, and pending switches or failures
     Sessions,
     /// Print the session router log
@@ -214,8 +227,17 @@ fn main() -> Result<()> {
         unreachable!("clap requires a command or --llm");
     };
     match command {
-        Commands::T3Claude { args } => launch::t3_claude(args, false),
-        Commands::Pick => launch::t3_claude(Vec::new(), true),
+        Commands::T3Claude { args } => borrow::dispatch(args, None, false, false),
+        Commands::Pick { borrow } => borrow::dispatch(
+            borrow
+                .map(|h| vec!["--borrow".into(), h.into()])
+                .unwrap_or_default(),
+            None,
+            true,
+            false,
+        ),
+        Commands::Lend => borrow::lend(),
+        Commands::LendRelease { lease_id } => borrow::release(&lease_id),
         Commands::AddKey { alias } => commands::add_key(&alias),
         Commands::Add {
             alias,
@@ -242,7 +264,7 @@ fn main() -> Result<()> {
         Commands::Refresh => commands::refresh(),
         Commands::Usage { live } => commands::usage(live),
         Commands::Start => proxy::run(),
-        Commands::Run { account, args } => launch::run(args, account.as_deref()),
+        Commands::Run { account, args } => borrow::dispatch(args, account.as_deref(), false, true),
         Commands::Sessions => launch::sessions(),
         Commands::NativeEvent => launch::native_event(),
         Commands::NativeMaintain { alias, email } => native::maintain_account(&alias, &email),

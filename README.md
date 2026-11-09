@@ -424,3 +424,10 @@ Honors `CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 [MIT](LICENSE)
 
 Use `cs t3-claude` or the `cs-t3-claude` symlink as a passthrough for t3. `cs pick` names the routed account without launching Claude.
+
+Borrow owner-routed subscription access with `cs run --borrow owner`,
+`cs t3-claude --borrow owner`, or `cs pick --borrow owner`.
+`CS_BORROW=owner` also works with the t3 shim; the CLI host takes precedence.
+The owner provides `cs lend` and idempotent `cs lend-release <lease_id>` over SSH.
+Only the access token reaches the child process; refresh credentials stay on the owner.
+Remote leases expire with the grant and are released when the child exits.
