@@ -352,6 +352,13 @@ impl Drop for RemoteLease {
         }
     }
 }
+pub fn pin_from_env() -> Option<String> {
+    std::env::var("CS_PIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub fn dispatch(
     mut args: Vec<OsString>,
     requested: Option<&str>,
@@ -375,19 +382,21 @@ pub fn dispatch(
             remaining.push(arg);
         }
     }
+    let pin = pin_from_env();
     let host = host.or_else(|| std::env::var("CS_BORROW").ok().filter(|h| !h.is_empty()));
     let Some(host) = host else {
+        let requested = requested.or(pin.as_deref());
         return if run {
             crate::launch::run(remaining, requested)
         } else {
-            crate::launch::t3_claude(remaining, pick)
+            crate::launch::t3_claude(remaining, pick, requested)
         };
     };
     if requested.is_some() {
         bail!("--borrow conflicts with --account");
     }
     if !run {
-        return crate::borrow_cache::t3(&host, remaining, pick);
+        return crate::borrow_cache::t3(&host, remaining, pick, pin.as_deref());
     }
     let output = ssh(&host, "lend")?;
     if !output.status.success() {

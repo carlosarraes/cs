@@ -182,6 +182,39 @@ fn choose(cache: &Cache, now: i64, five_ceiling: f64, weekly_ceiling: f64) -> Op
         .map(|(alias, _)| alias.clone())
 }
 
+fn check_pinned(cache: &Cache, pin: &str, now: i64) -> Result<()> {
+    let Some(entry) = cache.entries.get(pin) else {
+        bail!("{pin}: unknown pin; not in the borrow cache; no fallback");
+    };
+    if entry.access_token.is_empty() || entry.expires_at <= now + SPAWN_MIN_REMAINING_SECS {
+        bail!("{pin}: pinned account is expired; no fallback");
+    }
+    if entry.usage.as_ref().is_some_and(|u| {
+        window_exhausted(u.five_hour.as_ref(), now) || window_exhausted(u.seven_day.as_ref(), now)
+    }) {
+        bail!("{pin}: quota exhausted; no fallback");
+    }
+    Ok(())
+}
+
+fn pick_pinned(host: &str, pin: &str, record: bool) -> Result<(String, Cached)> {
+    with_cache(host, record, |cache| {
+        let now = usage::now();
+        check_pinned(cache, pin, now)?;
+        let newest = cache
+            .entries
+            .values()
+            .map(|e| e.last_used)
+            .max()
+            .unwrap_or(0);
+        let entry = cache.entries.get_mut(pin).expect("validated pin exists");
+        if record {
+            entry.last_used = chrono::Utc::now().timestamp_millis().max(newest + 1);
+        }
+        Ok((pin.to_string(), entry.clone()))
+    })
+}
+
 fn pick_cached(host: &str, record: bool) -> Result<Option<(String, Cached)>> {
     let routing = crate::config::load()?.routing;
     with_cache(host, record, |cache| {
@@ -361,7 +394,15 @@ fn budget() -> Duration {
 
 /// A usable grant for this spawn. Warm cache: no lock but the cache's own, no network. Cold:
 /// one process refreshes while the others wait, then everyone reads the shared result.
-fn acquire(host: &str, via: Option<&str>, record: bool) -> Result<(String, Cached)> {
+fn acquire(
+    host: &str,
+    via: Option<&str>,
+    record: bool,
+    pin: Option<&str>,
+) -> Result<(String, Cached)> {
+    if let Some(pin) = pin {
+        return pick_pinned(host, pin, record);
+    }
     if let Some(found) = pick_cached(host, record)? {
         return Ok(found);
     }
@@ -422,17 +463,18 @@ pub fn refresh_command(host: Option<&str>, via: Option<&str>) -> Result<()> {
 
 /// The t3 entry for `CS_BORROW` / `--borrow`: pick a cached grant and become Claude. Any
 /// borrow trouble falls back to the local login instead of failing the probe.
-pub fn t3(host: &str, args: Vec<OsString>, pick: bool) -> Result<()> {
+pub fn t3(host: &str, args: Vec<OsString>, pick: bool, pin: Option<&str>) -> Result<()> {
     let via = jump_host(None);
-    match acquire(host, via.as_deref(), !pick) {
+    match acquire(host, via.as_deref(), !pick, pin) {
         Ok((alias, grant)) if pick => {
             println!("{alias} ({})", grant.email);
             Ok(())
         }
         Ok((alias, grant)) => exec(host, &alias, &grant, args),
+        Err(error) if pin.is_some() => Err(error),
         Err(error) => {
             eprintln!("cs: borrow {host}: {error}; falling back to the local login");
-            crate::launch::t3_claude(args, pick)
+            crate::launch::t3_claude(args, pick, None)
         }
     }
 }
@@ -524,5 +566,36 @@ mod tests {
     fn aliases_from_the_owner_are_restricted() {
         assert!(valid_alias("carlos2") && valid_alias("a@b.io"));
         assert!(!valid_alias("") && !valid_alias("a b") && !valid_alias("a';rm"));
+    }
+
+    #[test]
+    fn pinned_account_is_accepted_even_when_it_is_not_least_recent() {
+        let now = usage::now();
+        let c = cache(&[("a", entry(7200, 1, None)), ("b", entry(7200, 9, None))]);
+        assert!(check_pinned(&c, "b", now).is_ok());
+        let error = check_pinned(&c, "missing", now).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown pin") && error.contains("no fallback"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pinned_expired_or_exhausted_account_is_rejected() {
+        let now = usage::now();
+        let c = cache(&[
+            ("old", entry(60, 0, None)),
+            ("out", entry(7200, 0, Some(100.))),
+        ]);
+        let expired = check_pinned(&c, "old", now).unwrap_err().to_string();
+        assert!(
+            expired.contains("expired") && expired.contains("no fallback"),
+            "{expired}"
+        );
+        let exhausted = check_pinned(&c, "out", now).unwrap_err().to_string();
+        assert!(
+            exhausted.contains("quota exhausted") && exhausted.contains("no fallback"),
+            "{exhausted}"
+        );
     }
 }

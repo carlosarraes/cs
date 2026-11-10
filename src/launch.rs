@@ -811,8 +811,20 @@ pub fn sessions() -> Result<()> {
     })
 }
 
-pub fn t3_claude(args: Vec<OsString>, pick: bool) -> Result<()> {
+pub fn t3_claude(args: Vec<OsString>, pick: bool, requested: Option<&str>) -> Result<()> {
     let accounts = state::State::load()?;
+    if let Some(name) = requested {
+        let (alias, account) = resolve_account(&accounts, name)?;
+        if !account.is_key() && !crate::routing::store::token_valid(account, crate::usage::now()) {
+            bail!("{alias}: token expired or unavailable; no fallback");
+        }
+        let pinned = alias.to_string();
+        if pick {
+            println!("{pinned} ({})", account.email);
+            return Ok(());
+        }
+        return t3_exec(args, accounts, Some(pinned));
+    }
     if accounts
         .claude()
         .accounts
@@ -833,7 +845,7 @@ pub fn t3_claude(args: Vec<OsString>, pick: bool) -> Result<()> {
     if pick {
         return t3_pick(accounts);
     }
-    t3_exec(args, accounts)
+    t3_exec(args, accounts, None)
 }
 
 fn t3_pick(mut accounts: state::State) -> Result<()> {
@@ -940,7 +952,7 @@ fn t3_stale_usage_fallback(
 /// t3 tracks and kills the pid it spawned and expects it to be Claude itself, so this path
 /// picks an account from local state only and replaces this process with Claude. No
 /// supervisor, credential renewal, or network access may live here.
-fn t3_exec(args: Vec<OsString>, accounts: state::State) -> Result<()> {
+fn t3_exec(args: Vec<OsString>, accounts: state::State, pin: Option<String>) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let source = crate::native::source_config()?;
     let root = uuid::Uuid::new_v4().to_string();
@@ -949,7 +961,7 @@ fn t3_exec(args: Vec<OsString>, accounts: state::State) -> Result<()> {
     let store = Store::default_path()?;
     let token = store.register()?;
     let launch = (|| -> Result<(crate::native::NativeCommand, String, String)> {
-        let forced = t3_stale_usage_fallback(&accounts, &observation, &cfg);
+        let forced = pin.or_else(|| t3_stale_usage_fallback(&accounts, &observation, &cfg));
         let (account, alias) = store.reserve_native(
             &token,
             &root,

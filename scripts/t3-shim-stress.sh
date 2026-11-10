@@ -287,6 +287,28 @@ started = time.time()
 threading.Thread(target=monitor, daemon=True).start()
 with ThreadPoolExecutor(CONCURRENCY) as pool:
     list(pool.map(run_one, range(CYCLES)))
+
+def cache_last_used():
+    with open(os.path.join(data, "cs", "borrow", "owner.json")) as f:
+        entries = json.load(f)["entries"]
+    return {alias: int(entries[alias].get("last_used") or 0) for alias in ("ba", "bb")}
+
+pin_elapsed = 0.0
+if BORROW:
+    pin_env = dict(borrow_env, CS_PIN="ba")
+    before_pin = cache_last_used()
+    def pick_env(rng, _env=pin_env):
+        return _env
+    pin_started = time.time()
+    with ThreadPoolExecutor(CONCURRENCY) as pool:
+        list(pool.map(run_one, range(CYCLES)))
+    pin_elapsed = time.time() - pin_started
+    after_pin = cache_last_used()
+    if after_pin["ba"] <= before_pin["ba"]:
+        fail("pin", "pinned alias ba was not used")
+    if after_pin["bb"] != before_pin["bb"]:
+        fail("pin", "unpinned alias bb changed during the pin phase")
+
 elapsed = time.time() - started
 
 deadline = time.time() + REAP_SECS
@@ -309,7 +331,7 @@ if BORROW:
     except (OSError, ValueError, KeyError) as error:
         fail("borrow", f"cache unreadable: {error!r}")
 
-print(f"cycles={CYCLES} concurrency={CONCURRENCY} seed={SEED} borrow={int(BORROW)} elapsed={elapsed:.1f}s")
+print(f"cycles={CYCLES} concurrency={CONCURRENCY} seed={SEED} borrow={int(BORROW)} pin={int(BORROW)} elapsed={elapsed:.1f}s pin_elapsed={pin_elapsed:.1f}s")
 print(f"before: {before}")
 if BORROW:
     print(f"ssh calls: warm-up={warm_ssh_calls} total={ssh_calls()}")

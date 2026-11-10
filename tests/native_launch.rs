@@ -83,6 +83,8 @@ printf 'FAKE_CLAUDE_OK\n'
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            .env_remove("CS_PIN")
+            .env_remove("CS_BORROW")
             .env("ANTHROPIC_API_KEY", "wrong-account-key")
             .env("CLAUDE_CODE_OAUTH_TOKEN", "wrong-account-token")
             .env("TEST_ARGS", self.temp.path().join("args"))
@@ -2017,6 +2019,107 @@ fn warm_cache_t3_spawn_execs_claude_without_touching_ssh_and_rotates() {
         "consecutive spawns rotate across the cache"
     );
     assert_eq!(ssh_calls(&f, ""), calls, "warm spawns never run ssh");
+}
+
+#[test]
+fn t3_pin_uses_the_named_borrowed_alias_and_does_not_rotate() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    refresh_cache(&f, &owner_ssh(&f, &o));
+    let calls = ssh_calls(&f, "");
+    let broken = broken_ssh(&f, true);
+    for _ in 0..2 {
+        let output = f
+            .command()
+            .env("CS_SSH", &broken)
+            .env("CS_BORROW", "owner")
+            .env("CS_PIN", "ob")
+            .args(["t3-claude", "--version"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("-> ob ("), "{stderr}");
+        assert!(!stderr.contains("-> oa ("), "{stderr}");
+        assert!(!stderr.contains("falling back"), "{stderr}");
+        assert!(
+            !stderr.contains("-access") && !stderr.contains("-refresh"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(ssh_calls(&f, ""), calls, "pinned warm spawns never run ssh");
+}
+
+#[test]
+fn t3_unknown_or_expired_pin_fails_without_starting_claude_or_falling_back() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    refresh_cache(&f, &owner_ssh(&f, &o));
+    let calls = ssh_calls(&f, "");
+    let broken = broken_ssh(&f, true);
+    let output = f
+        .command()
+        .env("CS_SSH", &broken)
+        .env("CS_BORROW", "owner")
+        .env("CS_PIN", "missing")
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown pin"), "{stderr}");
+    assert!(stderr.contains("no fallback"), "{stderr}");
+    assert!(!stderr.contains("falling back"), "{stderr}");
+    assert!(!f.temp.path().join("child.pid").exists());
+
+    let cache_path = f.data.join("cs/borrow/owner.json");
+    let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    cache["entries"]["oa"]["expires_at"] = json!(chrono::Utc::now().timestamp());
+    fs::write(&cache_path, cache.to_string()).unwrap();
+    let output = f
+        .command()
+        .env("CS_SSH", &broken)
+        .env("CS_BORROW", "owner")
+        .env("CS_PIN", "oa")
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expired"), "{stderr}");
+    assert!(stderr.contains("no fallback"), "{stderr}");
+    assert!(!stderr.contains("falling back"), "{stderr}");
+    assert!(!f.temp.path().join("child.pid").exists());
+    assert_eq!(ssh_calls(&f, ""), calls, "failed pins do not refresh");
+}
+
+#[test]
+fn t3_empty_pin_is_off() {
+    let o = owner_fixture(7200);
+    let f = Fixture::new();
+    refresh_cache(&f, &owner_ssh(&f, &o));
+    let output = f
+        .command()
+        .env("CS_SSH", broken_ssh(&f, true))
+        .env("CS_BORROW", "owner")
+        .env("CS_PIN", "")
+        .args(["t3-claude", "--version"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("-> oa (") || stderr.contains("-> ob ("),
+        "{stderr}"
+    );
 }
 
 #[test]
