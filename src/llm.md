@@ -163,3 +163,4 @@ Owner commands: cs lend [--alias NAME] emits one access-only JSON grant and rene
 account; cs lend --inventory lists aliases, expiry and usage with no credentials;
 --no-lease skips the owner lease; cs lend-release LEASE_ID releases a durable lease.
 Refresh credentials remain on the owner.
+For a live list of t3 instance ids and aliases on this machine: `cs --t3`.

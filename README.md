@@ -48,7 +48,8 @@ tests require just and mock remote commands; they never contact real hosts.
 ## Usage
 
 Run `cs --llm` for the compact agent guide, including routing rules and
-targeted-switch examples.
+targeted-switch examples. Run `cs --t3` for a live guide to the t3 shim,
+instance ids, and account aliases on this machine.
 
 ```sh
 cs add work              # log in, save "work", restore the previously selected login

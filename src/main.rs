@@ -17,6 +17,7 @@ mod session_control;
 mod snapshot;
 mod spend;
 mod state;
+mod t3_guide;
 mod usage;
 mod util;
 
@@ -31,6 +32,7 @@ use clap::{Parser, Subcommand};
     arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
     after_help = "Agent guide: cs --llm
+t3 shim guide: cs --t3
 Examples: cs run -- --resume pm
           cs switch work --only personal
           cs switch work --session <UUID> --interrupt"
@@ -39,6 +41,9 @@ struct Cli {
     /// Print a compact agent guide with command examples and routing rules
     #[arg(long)]
     llm: bool,
+    /// Print a short guide to using cs as a t3 shim
+    #[arg(long)]
+    t3: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -253,8 +258,12 @@ fn main() -> Result<()> {
         print!("{}", include_str!("llm.md"));
         return Ok(());
     }
+    if cli.t3 {
+        t3_guide::print();
+        return Ok(());
+    }
     let Some(command) = cli.command else {
-        unreachable!("clap requires a command or --llm");
+        unreachable!("clap requires a command, --llm, or --t3");
     };
     match command {
         Commands::T3Claude { args } => borrow::dispatch(args, None, false, false),
@@ -334,6 +343,19 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(args, [std::ffi::OsString::from("--llm")]);
+    }
+
+    #[test]
+    fn t3_guide_is_standalone_and_does_not_steal_passthrough() {
+        let cli = Cli::try_parse_from(["cs", "--t3"]).unwrap();
+        assert!(cli.t3 && cli.command.is_none());
+        assert!(Cli::try_parse_from(["cs", "--t3", "list"]).is_err());
+        let cli = Cli::try_parse_from(["cs", "run", "--", "--t3"]).unwrap();
+        let Some(Commands::Run { args, .. }) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(!cli.t3);
+        assert_eq!(args, [std::ffi::OsString::from("--t3")]);
     }
 
     #[test]
