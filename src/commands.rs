@@ -509,8 +509,8 @@ fn saved_expires_at(data: &Value) -> Option<i64> {
 }
 
 /// Refresh the saved tokens of every non-current account whose access token has
-/// (nearly) expired, so their usage stays pollable. The current account is left
-/// to Claude Code. `skip` lets the daemon rate-limit retries per alias. Each
+/// (nearly) expired, so their usage stays pollable. The daemon renews the current
+/// account separately through the guarded native renewal path. Each
 /// success is saved immediately: the old refresh token is dead once exchanged.
 fn refresh_is_owned(
     alias: &str,

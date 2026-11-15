@@ -179,7 +179,7 @@ pub fn maintain() -> Result<()> {
             continue;
         }
         if let Err(error) = crate::commands::renew_native_account(alias, &account.email) {
-            eprintln!("cs: {alias}: credential renewal unavailable: {error}");
+            crate::accounts::log_renewal_failure(alias, &error);
         }
     }
     sync_all()
@@ -190,6 +190,7 @@ pub fn maintain_account(alias: &str, email: &str) -> Result<()> {
     require_profile_identity(&profile, email)?;
     let _ = crate::commands::refresh_current_if_stale();
     crate::commands::renew_native_account(alias, email)
+        .inspect_err(|error| crate::accounts::log_renewal_failure(alias, error))
         .with_context(|| format!("{alias}: credential renewal unavailable"))?;
     let _credentials = crate::accounts::credential_lock()?;
     let accounts = state::State::load()?;
