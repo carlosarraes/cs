@@ -10,12 +10,10 @@ mod launch;
 mod login;
 mod native;
 mod policy;
-mod pricing;
 mod proxy;
 mod routing;
 mod session_control;
 mod snapshot;
-mod spend;
 mod state;
 mod t3_guide;
 mod usage;
@@ -152,7 +150,7 @@ cannot change accounts again; start a new conversation for another account.")]
     Whoami,
     /// Update a saved alias with the live credentials (after a `/login` outside cs)
     Refresh,
-    /// Show subscription quotas and API-key 7d/30d spend; --live fetches now
+    /// Show subscription quotas; --live fetches now
     Usage {
         /// Poll the API right now instead of reading the router's last observation
         #[arg(long)]

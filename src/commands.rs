@@ -694,14 +694,6 @@ pub fn usage(live: bool) -> Result<()> {
     if obs.observed_at == 0 {
         obs.observed_at = now;
     }
-    usage::observe_spend(
-        state.claude(),
-        previous.as_ref(),
-        &mut obs,
-        now,
-        &config::load()?.spend,
-        live,
-    );
     obs.save()?;
     let counts = crate::routing::store::Store::default_path()?.update(|s| Ok(s.counts()))?;
     for line in usage::format_lines_with_counts(&obs, now, usage::colors_enabled(), &counts) {

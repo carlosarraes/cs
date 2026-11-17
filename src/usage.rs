@@ -44,21 +44,14 @@ pub struct Usage {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reading {
     Known(Usage),
-    Unknown {
-        reason: String,
-    },
-    Spend {
-        key_hint: String,
-        totals: Option<crate::spend::Totals>,
-        reason: Option<String>,
-    },
+    Unknown { reason: String },
 }
 
 impl Reading {
     pub fn known(&self) -> Option<&Usage> {
         match self {
             Reading::Known(u) => Some(u),
-            Reading::Unknown { .. } | Reading::Spend { .. } => None,
+            Reading::Unknown { .. } => None,
         }
     }
 }
@@ -106,9 +99,6 @@ pub struct Observation {
     pub last_switch_at: Option<i64>,
     #[serde(default)]
     pub accounts: BTreeMap<String, Entry>,
-    /// All local Claude Code JSONL spend (any account), estimated.
-    #[serde(default)]
-    pub local_total: Option<Entry>,
 }
 
 impl Observation {
@@ -121,9 +111,16 @@ impl Observation {
             return Ok(None);
         }
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let parse = || -> Result<Observation> {
+            let mut v: Value = serde_json::from_slice(&bytes)?;
+            // Caches from versions that estimated API-key spend hold readings we no longer model.
+            if let Some(accounts) = v["accounts"].as_object_mut() {
+                accounts.retain(|_, e| e["reading"]["status"] != "spend");
+            }
+            Ok(serde_json::from_value(v)?)
+        };
         Ok(Some(
-            serde_json::from_slice(&bytes)
-                .with_context(|| format!("parsing {}", path.display()))?,
+            parse().with_context(|| format!("parsing {}", path.display()))?,
         ))
     }
 
@@ -189,93 +186,6 @@ pub fn observe(
     obs
 }
 
-pub fn observe_spend(
-    ps: &ProviderState,
-    prev: Option<&Observation>,
-    obs: &mut Observation,
-    now: i64,
-    cfg: &crate::config::Spend,
-    force: bool,
-) {
-    let needs_any = {
-        let prev_local = prev.and_then(|p| p.local_total.as_ref());
-        needs_poll(
-            prev_local,
-            false,
-            now,
-            if force { 0 } else { cfg.poll_secs },
-        ) || ps.accounts.iter().any(|(alias, account)| {
-            matches!(account.kind, Some(crate::state::AccountKind::ApiKey { .. }))
-                && needs_poll(
-                    prev.and_then(|p| p.accounts.get(alias)),
-                    false,
-                    now,
-                    if force { 0 } else { cfg.poll_secs },
-                )
-        })
-    };
-    let prices = needs_any.then(|| crate::pricing::Pricing::load(cfg.live_pricing));
-
-    // Aggregate local Claude usage (all sessions). Always labelled est.
-    let prev_local = prev.and_then(|p| p.local_total.as_ref());
-    if needs_poll(
-        prev_local,
-        false,
-        now,
-        if force { 0 } else { cfg.poll_secs },
-    ) {
-        let pricing = prices.as_ref().unwrap();
-        let (totals, reason) = match crate::spend::poll_local(now, pricing) {
-            Ok(totals) => (Some(totals), None),
-            Err(error) => (None, Some(error.reason.into())),
-        };
-        obs.local_total = Some(settle(
-            Polled {
-                reading: Reading::Spend {
-                    key_hint: "local".into(),
-                    totals,
-                    reason,
-                },
-                retry_after: None,
-            },
-            prev_local,
-            now,
-        ));
-    } else if let Some(entry) = prev_local {
-        obs.local_total = Some(entry.clone());
-    }
-
-    for (alias, account) in &ps.accounts {
-        let Some(crate::state::AccountKind::ApiKey { key_hint, .. }) = &account.kind else {
-            continue;
-        };
-        let previous = prev.and_then(|p| p.accounts.get(alias)).filter(
-            |e| matches!(&e.reading, Reading::Spend { key_hint: hint, .. } if hint == key_hint),
-        );
-        if !needs_poll(previous, false, now, if force { 0 } else { cfg.poll_secs }) {
-            if let Some(entry) = previous {
-                obs.accounts.insert(alias.clone(), entry.clone());
-            }
-            continue;
-        }
-        let pricing = prices.as_ref().unwrap();
-        let (totals, reason) = match crate::spend::poll(alias, account, now, pricing) {
-            Ok(totals) => (Some(totals), None),
-            Err(error) => (None, Some(error.reason.into())),
-        };
-        let polled = Polled {
-            reading: Reading::Spend {
-                key_hint: key_hint.clone(),
-                totals,
-                reason,
-            },
-            retry_after: None,
-        };
-        obs.accounts
-            .insert(alias.clone(), settle(polled, previous, now));
-    }
-}
-
 /// Whether an account needs a fresh poll: never while backed off after a 429;
 /// always for the current account otherwise; non-current ones only once their
 /// last fetch is older than `idle_poll_secs`.
@@ -299,16 +209,7 @@ fn settle(polled: Polled, prev: Option<&Entry>, now: i64) -> Entry {
     let mut entry = Entry::new(polled.reading, now);
     if let Some(secs) = polled.retry_after {
         entry.backoff_until = Some(now + secs as i64);
-        if let Some(p) = prev.filter(|e| {
-            e.reading.known().is_some()
-                || matches!(
-                    e.reading,
-                    Reading::Spend {
-                        totals: Some(_),
-                        ..
-                    }
-                )
-        }) {
+        if let Some(p) = prev.filter(|e| e.reading.known().is_some()) {
             entry.reading = p.reading.clone();
             entry.fetched_at = p.fetched_at;
         }
@@ -383,39 +284,9 @@ pub fn format_lines_with_counts(
         };
         color_window(text, w.utilization, color)
     };
-    let mut lines: Vec<String> = obs
-        .accounts
+    obs.accounts
         .iter()
         .map(|(alias, e)| {
-            if let Reading::Spend {
-                key_hint,
-                totals,
-                reason,
-            } = &e.reading
-            {
-                let hint = key_hint.strip_prefix("sk-ant-").unwrap_or("…????");
-                let mut text = match totals {
-                    Some(totals) => {
-                        let time = e
-                            .fetched_at
-                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                            .unwrap_or_else(|| "??:??".into());
-                        format!(
-                            "${:.2} 7d  ${:.2} 30d  (as of {time}) est.",
-                            totals.seven_day_usd, totals.thirty_day_usd
-                        )
-                    }
-                    None => format!(
-                        "spend unknown: {}",
-                        reason.as_deref().unwrap_or("not polled")
-                    ),
-                };
-                if let Some(until) = e.backoff_until.filter(|t| *t > now) {
-                    text.push_str(&format!("; retry in {}", fmt_duration(until - now)));
-                }
-                return format!("{alias}  [key {hint}]  {text}");
-            }
             let is_current = obs.current.as_deref() == Some(alias.as_str());
             let since = if is_current {
                 match obs.current_since {
@@ -429,7 +300,6 @@ pub fn format_lines_with_counts(
                 }
             };
             let mut parts = match &e.reading {
-                Reading::Spend { .. } => unreachable!(),
                 Reading::Known(u) => {
                     let mut p = vec![u
                         .five_hour
@@ -470,30 +340,7 @@ pub fn format_lines_with_counts(
             }
             format!("{:<width$}  {}", labels[alias], parts.join(" · "))
         })
-        .collect();
-    if let Some(e) = &obs.local_total {
-        if let Reading::Spend { totals, reason, .. } = &e.reading {
-            let text = match totals {
-                Some(totals) => {
-                    let time = e
-                        .fetched_at
-                        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                        .unwrap_or_else(|| "??:??".into());
-                    format!(
-                        "${:.2} 7d  ${:.2} 30d  (as of {time}) est.",
-                        totals.seven_day_usd, totals.thirty_day_usd
-                    )
-                }
-                None => format!(
-                    "spend unknown: {}",
-                    reason.as_deref().unwrap_or("not polled")
-                ),
-            };
-            lines.push(format!("local  {text}"));
-        }
-    }
-    lines
+        .collect()
 }
 
 /// `usage.json` lives beside `state.json`.
@@ -695,87 +542,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn spend_format_and_backoff_keep_dollars_and_as_of_without_quota() {
-        let reading = Reading::Spend {
-            key_hint: "sk-ant-…ABCD".into(),
-            totals: Some(crate::spend::Totals {
-                seven_day_usd: 12.4,
-                thirty_day_usd: 48.1,
-            }),
-            reason: None,
-        };
-        let entry = Entry::new(reading, 1000);
-        let observation = Observation {
-            accounts: BTreeMap::from([("work-api".into(), entry.clone())]),
-            ..Default::default()
-        };
-        let line = &format_lines(&observation, 1001)[0];
-        assert!(line.starts_with("work-api  [key …ABCD]  $12.40 7d  $48.10 30d  (as of "));
-        assert!(line.ends_with(") est."));
-        assert!(!line.contains('%'));
-        assert!(!line.contains("manual"));
-        assert!(!needs_poll(Some(&entry), false, 4599, 3600));
-        assert!(needs_poll(Some(&entry), false, 4600, 3600));
-        let backoff = settle(
-            Polled {
-                reading: Reading::Spend {
-                    key_hint: "sk-ant-…ABCD".into(),
-                    totals: None,
-                    reason: Some("rate limited".into()),
-                },
-                retry_after: Some(60),
-            },
-            Some(&entry),
-            1100,
-        );
-        assert_eq!(backoff.fetched_at, Some(1000));
-        assert!(!needs_poll(Some(&backoff), true, 1159, 0));
-        assert!(matches!(
-            backoff.reading,
-            Reading::Spend {
-                totals: Some(_),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn old_cache_loads_and_spend_unknown_never_becomes_a_quota_reading() {
-        let old: Observation = serde_json::from_value(json!({"observed_at":1,"accounts":{
-            "work":{"reading":{"status":"known","five_hour":null,"seven_day":null}}
-        }}))
+    fn caches_with_old_spend_readings_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        fs::write(
+            &path,
+            json!({"observed_at":1,"local_total":{"reading":{"status":"spend","key_hint":"local"}},
+            "accounts":{
+                "work":{"reading":{"status":"known","five_hour":null,"seven_day":null}},
+                "key":{"reading":{"status":"spend","key_hint":"sk-ant-…ABCD","totals":null}}
+            }})
+            .to_string(),
+        )
         .unwrap();
-        assert!(old.accounts["work"].reading.known().is_some());
-        let key = Reading::Spend {
-            key_hint: "sk-ant-…ABCD".into(),
-            totals: None,
-            reason: Some("could not read Claude project logs".into()),
-        };
-        assert!(key.known().is_none());
-        let obs = Observation {
-            accounts: BTreeMap::from([("work-api".into(), Entry::new(key, 1))]),
-            local_total: Some(Entry::new(
-                Reading::Spend {
-                    key_hint: "local".into(),
-                    totals: Some(crate::spend::Totals {
-                        seven_day_usd: 1.5,
-                        thirty_day_usd: 9.25,
-                    }),
-                    reason: None,
-                },
-                1,
-            )),
-            ..Default::default()
-        };
-        let lines = format_lines(&obs, 2);
-        assert!(lines[0].contains("spend unknown: could not read Claude project logs"));
-        assert!(lines
-            .iter()
-            .any(|l| l.starts_with("local  $1.50 7d  $9.25 30d") && l.contains("est.")));
-        assert_eq!(
-            serde_json::from_str::<Observation>(&serde_json::to_string(&obs).unwrap()).unwrap(),
-            obs
-        );
+        let obs = Observation::load_from(&path).unwrap().unwrap();
+        assert_eq!(obs.accounts.keys().collect::<Vec<_>>(), ["work"]);
+        assert!(obs.accounts["work"].reading.known().is_some());
     }
 
     const FIXTURE_RESET: &str = "2026-08-23T19:50:00.188677+00:00";

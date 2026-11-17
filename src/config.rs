@@ -10,21 +10,6 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub routing: Routing,
-    pub spend: Spend,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Spend {
-    pub poll_secs: u64,
-    pub live_pricing: bool,
-}
-impl Default for Spend {
-    fn default() -> Self {
-        Self {
-            poll_secs: 3600,
-            live_pricing: false,
-        }
-    }
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -48,7 +33,7 @@ impl Default for Routing {
         }
     }
 }
-pub const DEFAULT_TOML:&str="[routing]\nport = 18437\npoll_secs = 60\nreport_secs = 300\nmax_usage_age_secs = 300\nfive_hour_ceiling = 90\nweekly_ceiling = 95\n\n[spend]\npoll_secs = 3600\nlive_pricing = false\n";
+pub const DEFAULT_TOML:&str="[routing]\nport = 18437\npoll_secs = 60\nreport_secs = 300\nmax_usage_age_secs = 300\nfive_hour_ceiling = 90\nweekly_ceiling = 95\n";
 pub fn config_home() -> Result<PathBuf> {
     Ok(match std::env::var_os("XDG_CONFIG_HOME") {
         Some(d) if !d.is_empty() && Path::new(&d).is_absolute() => PathBuf::from(d),
@@ -68,6 +53,8 @@ fn load_from(path: &Path) -> Result<Config> {
     let mut value: toml::Value =
         toml::from_str(&fs::read_to_string(path)?).context("parsing cs config")?;
     if let Some(table) = value.as_table_mut() {
+        // Written by default config files from versions that estimated spend.
+        table.remove("spend");
         let mut obsolete = false;
         for key in ["auto-switcher", "report", "warmup"] {
             obsolete |= table.remove(key).is_some();
@@ -77,9 +64,6 @@ fn load_from(path: &Path) -> Result<Config> {
         }
     }
     let cfg: Config = value.try_into()?;
-    if cfg.spend.poll_secs == 0 || cfg.spend.poll_secs > i64::MAX as u64 {
-        bail!("invalid spend settings: positive poll_secs required");
-    }
     let r = &cfg.routing;
     if r.poll_secs == 0
         || r.max_usage_age_secs < r.poll_secs
@@ -122,18 +106,14 @@ mod tests {
     }
 
     #[test]
-    fn spend_defaults_preserve_old_configs_and_reject_unknown_or_zero_settings() {
+    fn old_spend_section_is_ignored() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.toml");
-        fs::write(&p, "[routing]\nport=12345\n").unwrap();
-        assert_eq!(load_from(&p).unwrap().spend.poll_secs, 3600);
-        fs::write(&p, "[spend]\npoll_secs=120\nlive_pricing=true\n").unwrap();
-        let cfg = load_from(&p).unwrap();
-        assert_eq!(cfg.spend.poll_secs, 120);
-        assert!(cfg.spend.live_pricing);
-        fs::write(&p, "[spend]\npoll_secs=0\n").unwrap();
-        assert!(load_from(&p).is_err());
-        fs::write(&p, "[spend]\nunknown=true\n").unwrap();
-        assert!(load_from(&p).is_err());
+        fs::write(
+            &p,
+            "[routing]\nport=12345\n\n[spend]\npoll_secs=120\nlive_pricing=true\n",
+        )
+        .unwrap();
+        assert_eq!(load_from(&p).unwrap().routing.port, 12345);
     }
 }

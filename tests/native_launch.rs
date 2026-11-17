@@ -1092,7 +1092,7 @@ fn failed_shared_restore_does_not_flip_selection_or_queue_moves() {
 }
 
 #[test]
-fn plain_switch_to_key_resumes_managed_conversations_and_attributes_only_new_spend() {
+fn plain_switch_to_key_resumes_managed_conversations() {
     let f = interactive_fixture();
     let mut add = f
         .command()
@@ -1171,11 +1171,6 @@ fn plain_switch_to_key_resumes_managed_conversations_and_attributes_only_new_spe
     .unwrap();
     let usage = f.command().arg("usage").output().unwrap();
     assert!(usage.status.success());
-    assert!(
-        String::from_utf8_lossy(&usage.stdout).contains("$3.00 7d  $3.00 30d"),
-        "{}",
-        String::from_utf8_lossy(&usage.stdout)
-    );
     let retry = f
         .command()
         .args(["switch", "b", "--only", "limit"])

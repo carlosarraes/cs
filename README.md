@@ -82,7 +82,7 @@ cs snapshot restore      # after a reboot: reopen them all in tmux
 | `cs whoami` | Show the live signed-in account |
 | `cs refresh` | Re-capture the live credentials into the alias they belong to |
 | `cs switch next` | Activate the least-used (5h) account |
-| `cs usage [--live]` | Show subscription quotas and API-key spend for 7/30 days; `--live` refreshes now |
+| `cs usage [--live]` | Show subscription quotas; `--live` refreshes now |
 | `cs snapshot` | Save the currently-open Claude sessions (`list`/`restore`/`del` manage them) |
 | `cs run [--account <alias-or-email>] [-- <claude args>]` | Launch a native Claude conversation with automatic selection or an explicit account |
 | `cs sessions` | List live managed conversations and accounts |
@@ -123,13 +123,11 @@ from 70% to below 90%, red from 90%, and bold red at 100% or above. Each window'
 percentage and reset countdown share its color. Piped output stays plain;
 `NO_COLOR=1` or `TERM=dumb` disables colors.
 
-## Anthropic API-key spend
+## Anthropic API keys
 
 ```sh
 cs add-key work-api            # paste an Anthropic API key (masked stdin)
 cs run --account work-api -- -p "say hi"
-cs usage
-cs usage --live
 cs del work-api                # removes the API key secret
 ```
 
@@ -147,39 +145,6 @@ and redacted hint. Unmanaged `claude` may still need `cs run` to use the key.
 Switching back to a subscription restores OAuth and future subscription launches
 strip API-key environment variables. Keys stay out of automatic quota routing,
 `cs switch next`, and the proxy.
-
-`cs usage` prints one estimated spend row per key, plus a `local` total for every
-Claude Code session on this machine (any account). Figures are token×price estimates
-from local JSONL logs (same approach as ccost/ccusage), not Anthropic invoices:
-
-```text
-work-api  [key …ABCD]  $12.40 7d  $48.10 30d  (as of 21:40) est.
-local  $40.00 7d  $120.00 30d  (as of 21:40) est.
-```
-
-Claude Code JSONL does not record which API key a request used. Per-alias lines
-therefore count only session ids cs recorded when launching or moving to that key,
-including subagent directories. For a subscription conversation moved to a key,
-only log entries at or after the confirmed move count toward that key's spend. Sessions started outside cs are not attributed to a key, but
-still appear in the `local` total. Attribution survives closed sessions and router
-restarts; deleting an alias removes its attribution and cached spend. Using another
-login or key outside cs within an attributed conversation makes that alias estimate
-unreliable.
-
-Estimates apply standard model token prices to uncached input, output, five-minute
-cache writes, one-hour cache writes, and cache reads. They sum midnight-UTC windows
-for the last 7 and 30 days through now; the current day is partial. The displayed
-`as of` time uses your local timezone. Totals omit discounts, batch or premium-tier
-adjustments, tools, and other non-token charges. Local estimates deduplicate message
-id plus request id and prefer parent records over sidechain replays. Unknown models
-use Sonnet fallback prices, with one warning per invocation. A static Claude price
-table works offline. Optional LiteLLM pricing uses
-`model_prices_and_context_window.json`, cached for 24 hours under cs's cache
-directory, with a three-second fetch timeout and cached/static fallback.
-
-Spend refreshes at most once per `[spend] poll_secs`, default 3600, when the daemon
-polls or `cs usage` runs. `--live` forces a refresh. Unavailable readings show
-`spend unknown: REASON`.
 
 ## Session routing
 
@@ -329,10 +294,6 @@ report_secs = 300
 max_usage_age_secs = 300
 five_hour_ceiling = 90       # admission limit; existing assignments stay
 weekly_ceiling = 95
-
-[spend]
-poll_secs = 3600
-live_pricing = false         # opt into LiteLLM refresh; offline static table otherwise
 ```
 
 The server prints cached usage and active session counts at startup and every

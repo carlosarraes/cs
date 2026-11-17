@@ -97,61 +97,6 @@ fn add_list_delete_keep_secrets_out_of_output_state_and_config() {
 }
 
 #[test]
-fn usage_estimates_only_assigned_sessions_and_obeys_cache_and_live_refresh() {
-    let f = Fixture::new();
-    assert!(f.add().status.success());
-    let source = f.0.path().join("claude/projects/project");
-    fs::create_dir_all(&source).unwrap();
-    let log = |input: u64| {
-        serde_json::json!({"timestamp":chrono::Utc::now().to_rfc3339(),
-        "sessionId":"ours","requestId":"request","version":"2.0.1",
-        "message":{"id":"message","model":"unknown-model","usage":{"input_tokens":input}}})
-        .to_string()
-    };
-    fs::write(
-        source.join("session.jsonl"),
-        format!(
-            "{}\n{}",
-            log(1_000_000),
-            log(100_000_000).replace("ours", "outside")
-        ),
-    )
-    .unwrap();
-    fs::write(
-        f.0.path().join("data/cs/routing.json"),
-        r#"{"leases":{},"bindings":{},"key_sessions":{"ours":"work-api"}}"#,
-    )
-    .unwrap();
-    let first = f.command().arg("usage").output().unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let out = String::from_utf8_lossy(&first.stdout);
-    assert!(out.contains("work-api  [key …ABCD]  $3.00 7d  $3.00 30d  (as of "));
-    assert!(out.contains("est."));
-    assert!(out.contains("local  $"), "missing local total: {out}");
-    assert!(!out.contains("admin"), "{out}");
-    assert_eq!(
-        String::from_utf8_lossy(&first.stderr)
-            .matches("unknown Claude model")
-            .count(),
-        1
-    );
-    fs::write(source.join("session.jsonl"), log(2_000_000)).unwrap();
-    let cached = f.command().arg("usage").output().unwrap();
-    assert!(String::from_utf8_lossy(&cached.stdout).contains("$3.00 7d"));
-    let live = f.command().args(["usage", "--live"]).output().unwrap();
-    assert!(
-        live.status.success(),
-        "{}",
-        String::from_utf8_lossy(&live.stderr)
-    );
-    assert!(String::from_utf8_lossy(&live.stdout).contains("$6.00 7d"));
-}
-
-#[test]
 fn explicit_key_launch_injects_only_child_and_persists_attribution() {
     let f = Fixture::new();
     assert!(f.add().status.success());

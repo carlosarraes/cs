@@ -6,7 +6,7 @@ No server is required for cs run. This guide is static and makes no API calls.
 ## Inspect
 
 cs list                 # Saved aliases and emails
-cs usage                # Subscription quotas and API-key 7d/30d spend
+cs usage                # Subscription quotas
 cs usage --live          # Refresh usage now
 cs sessions             # Live conversation UUIDs, accounts, queued moves/errors
 cs whoami               # Shared OAuth identity or selected key mode
@@ -46,22 +46,6 @@ identity; whoami reports key mode. Unmanaged claude may need cs run to use the k
 Returning to a subscription restores OAuth and strips key environment variables
 from future subscription launches. Keys are excluded from automatic quota routing,
 switch next, and the proxy.
-
-`cs usage` shows `$X 7d  $Y 30d (as of HH:MM) est.` per key, plus a `local` line
-for all local Claude JSONL usage. Estimates use ccost/ccusage-style token×price
-math from local logs — not billed Anthropic spend. Per-key rows only count sessions
-cs launched or moved to that alias. Moved conversations count only log entries
-at or after the confirmed move; the local total includes the whole transcript.
-
-Token-price totals cover midnight UTC 7/30 days ago through now, not invoices or
-discounts/tools/premium charges. As-of time is local. Unknown models use fallback
-rates with one warning. Offline static prices work without a network request.
-
-[spend] poll_secs defaults to 3600; live_pricing=false optionally enables LiteLLM
-pricing when true, cached 24h with a 3s timeout and offline fallback. `cs usage`
-refreshes stale spend; --live forces refresh. Old state, config, and quota
-observations remain compatible.
-
 
 ## Move running conversations
 
