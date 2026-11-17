@@ -2,10 +2,10 @@ use crate::{config, routing::store::Store, state, usage};
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
-    extract::{Request, State as WebState},
+    extract::{Path, Request, State as WebState},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -136,8 +136,35 @@ async fn forward(WebState(app): WebState<Arc<App>>, request: Request) -> Respons
     };
     let oauth = account.data["claudeAiOauth"]["accessToken"]
         .as_str()
-        .unwrap_or_default();
-    let mut headers = parts.headers;
+        .unwrap_or_default()
+        .to_string();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| "/v1/messages".into());
+    relay(
+        &app,
+        parts.method,
+        &path,
+        parts.headers,
+        body,
+        &oauth,
+        guard,
+    )
+    .await
+}
+
+/// Sends a request upstream as `oauth`'s account and streams the reply back.
+async fn relay(
+    app: &App,
+    method: axum::http::Method,
+    path_and_query: &str,
+    mut headers: HeaderMap,
+    body: Bytes,
+    oauth: &str,
+    guard: impl Send + 'static,
+) -> Response {
     strip_headers(&mut headers);
     let beta = headers
         .get("anthropic-beta")
@@ -152,18 +179,9 @@ async fn forward(WebState(app): WebState<Arc<App>>, request: Request) -> Respons
     };
     headers.insert("anthropic-beta", beta.parse().expect("valid beta header"));
     headers.insert("accept-encoding", "identity".parse().unwrap());
-    let url = format!(
-        "{}{}",
-        app.upstream,
-        parts
-            .uri
-            .path_and_query()
-            .map(|v| v.as_str())
-            .unwrap_or("/v1/messages")
-    );
     let sent = app
         .client
-        .post(url)
+        .request(method, format!("{}{path_and_query}", app.upstream))
         .headers(headers)
         .bearer_auth(oauth)
         .body(body)
@@ -191,11 +209,66 @@ async fn forward(WebState(app): WebState<Arc<App>>, request: Request) -> Respons
     *response.headers_mut() = headers;
     response
 }
+
+/// The access token for `alias`, renewing it first when it has expired.
+fn hot_access(accounts: &std::path::Path, alias: &str, email: &str) -> Result<String> {
+    for attempt in 0..2 {
+        let saved = state::State::load_from(accounts)?;
+        let account = saved
+            .claude()
+            .accounts
+            .get(alias)
+            .filter(|a| a.email == email)
+            .with_context(|| format!("{alias}: account was removed or changed identity"))?;
+        if crate::routing::store::token_valid(account, usage::now() + 60) {
+            return Ok(account.data["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string());
+        }
+        if attempt == 0 {
+            crate::commands::renew_native_account(alias, email)?;
+        }
+    }
+    anyhow::bail!("{alias}: credentials expired and could not be renewed")
+}
+
+/// Per-session route used by `cs run`: Claude keeps its native login, and every
+/// request goes out as whichever account the conversation is bound to right now.
+async fn hot_forward(
+    WebState(app): WebState<Arc<App>>,
+    Path((lease, rest)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request exceeds 32 MiB"),
+    };
+    let copy = app.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let binding = copy.store.hot_binding(&lease)?;
+        hot_access(&copy.accounts, &binding.alias, &binding.email)
+    })
+    .await;
+    let oauth = match resolved {
+        Ok(Ok(token)) => token,
+        Ok(Err(e)) => return error(StatusCode::SERVICE_UNAVAILABLE, format!("cs: {e}")),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "assignment failed"),
+    };
+    let path = match parts.uri.query() {
+        Some(q) => format!("/{rest}?{q}"),
+        None => format!("/{rest}"),
+    };
+    relay(&app, parts.method, &path, parts.headers, body, &oauth, ()).await
+}
 fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/messages", post(forward))
         .route("/v1/messages/count_tokens", post(forward))
+        .route("/hot", get(|| async { "ok" }))
+        .route("/s/{lease}/{*rest}", any(hot_forward))
         .with_state(app)
 }
 fn client() -> Result<reqwest::Client> {
@@ -337,6 +410,81 @@ mod tests {
                 axum::serve(socket, app).await.unwrap();
             }),
         )
+    }
+    #[tokio::test]
+    async fn hot_sessions_use_the_currently_bound_account_per_request() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let (upstream, upstream_task) = serve(Router::new().route(
+            "/v1/messages",
+            post(move |uri: axum::http::Uri, headers: HeaderMap| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push((
+                        uri.to_string(),
+                        headers["authorization"].to_str().unwrap().to_string(),
+                    ));
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (app, lease) = fixture(dir.path(), upstream);
+        let mut state = State::load_from(&app.accounts).unwrap();
+        state.claude_mut().accounts.insert("b".into(), Account { kind: None, email: "b@x".into(), data: json!({"claudeAiOauth":{"accessToken":"b-secret","expiresAt":(usage::now()+7200)*1000}}) });
+        std::fs::write(&app.accounts, serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = app.store.clone();
+        store
+            .update(|s| {
+                let l = s.leases.get_mut(&lease).unwrap();
+                l.hot = true;
+                l.root = Some("root".into());
+                s.bindings.insert(
+                    "root".into(),
+                    crate::routing::assignments::Binding {
+                        alias: "a".into(),
+                        email: "a@x".into(),
+                        last_request: 0,
+                        in_flight: 0,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let (url, task) = serve(router(app)).await;
+        let http = client().unwrap();
+        let send = || {
+            http.post(format!("{url}/s/{lease}/v1/messages?beta=true"))
+                .bearer_auth("sk-ant-oat01-profile")
+                .body("{}")
+                .send()
+        };
+        assert_eq!(send().await.unwrap().status(), StatusCode::OK);
+        store.rebind(&["root".into()], "b", "b@x").unwrap();
+        assert_eq!(send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "/v1/messages?beta=true".to_string(),
+                    "Bearer upstream-secret".to_string()
+                ),
+                (
+                    "/v1/messages?beta=true".to_string(),
+                    "Bearer b-secret".to_string()
+                ),
+            ]
+        );
+        let closed = http
+            .post(format!("{url}/s/not-a-lease/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        task.abort();
+        upstream_task.abort();
     }
     #[test]
     fn explicit_header_does_not_require_metadata() {

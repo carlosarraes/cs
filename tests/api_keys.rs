@@ -16,6 +16,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cs"));
         command
             .current_dir(self.0.path())
+            .env("CS_NO_ROUTER", "1")
             .env("HOME", self.0.path())
             .env("XDG_DATA_HOME", self.0.path().join("data"))
             .env("XDG_CONFIG_HOME", self.0.path().join("config"))

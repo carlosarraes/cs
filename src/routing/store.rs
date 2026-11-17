@@ -45,6 +45,50 @@ impl Store {
         util::atomic_write(&self.path, &serde_json::to_vec(&data)?)?;
         Ok(result)
     }
+    /// Snapshot read without the write lock; writers replace the file atomically.
+    pub fn read<T>(&self, f: impl FnOnce(&Assignments) -> Result<T>) -> Result<T> {
+        let data: Assignments = match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("reading session assignments")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Assignments::default(),
+            Err(e) => return Err(e.into()),
+        };
+        f(&data)
+    }
+    /// The account a hot session's requests should use right now.
+    pub fn hot_binding(&self, token: &str) -> Result<Binding> {
+        self.read(|s| {
+            let root = s
+                .leases
+                .get(token)
+                .filter(|l| l.hot && l.alive())
+                .and_then(|l| l.root.clone())
+                .context("unknown or closed managed session")?;
+            s.bindings
+                .get(&root)
+                .cloned()
+                .context("missing conversation assignment")
+        })
+    }
+    pub fn mark_hot(&self, token: &str) -> Result<()> {
+        self.update(|s| {
+            s.leases.get_mut(token).context("unknown launch lease")?.hot = true;
+            Ok(())
+        })
+    }
+    /// Rebinds running hot conversations; their next request uses the new account.
+    pub fn rebind(&self, roots: &[String], alias: &str, email: &str) -> Result<()> {
+        self.update(|s| {
+            for root in roots {
+                let binding = s
+                    .bindings
+                    .get_mut(root)
+                    .context("missing conversation assignment")?;
+                binding.alias = alias.into();
+                binding.email = email.into();
+            }
+            Ok(())
+        })
+    }
     pub fn register(&self) -> Result<String> {
         let token = uuid::Uuid::new_v4().to_string();
         let process = Process::current()?;
@@ -55,6 +99,7 @@ impl Store {
                     expires_at: None,
                     process,
                     root: None,
+                    hot: false,
                 },
             );
             Ok(())
@@ -73,6 +118,7 @@ impl Store {
                     expires_at: None,
                     process,
                     root: Some(root.clone()),
+                    hot: false,
                 },
             );
             s.bindings.insert(

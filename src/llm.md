@@ -66,6 +66,12 @@ one UUID from cs sessions. Selectors leave shared login unchanged.
 Run cs sessions in another terminal; finding a UUID does not require a restart.
 --only/--from and --session are mutually exclusive.
 
+Sessions launched by cs run send requests through the local session router, which
+cs run starts in the background when needed. Their switches apply on the next
+request with no restart, even mid-turn; cs sessions marks them [instant switch]
+and switch prints "Switched". Set CS_NO_ROUTER=1 to opt out.
+
+Other sessions (older launches, API-key destinations, no router) restart instead.
 Without --interrupt, the move queues until Claude reports idle with no background
 agents. Idle sessions switch immediately; cs start is not needed for switching.
 Then cs restarts Claude on DEST and resumes the same conversation with supported

@@ -71,6 +71,7 @@ printf 'FAKE_CLAUDE_OK\n'
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cs"));
         cmd.current_dir(self.temp.path())
+            .env("CS_NO_ROUTER", "1")
             .env("XDG_DATA_HOME", &self.data)
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("CLAUDE_CONFIG_DIR", &self.source)
@@ -511,6 +512,63 @@ fn structural_switch(plain: bool, busy: bool, resume: bool) {
         .iter()
         .any(|arg| arg == "--resume"));
     assert_no_daemon(&f);
+}
+
+#[test]
+fn hot_session_switches_instantly_without_restart_even_while_busy() {
+    let f = interactive_fixture();
+    fs::write(f.temp.path().join("structural-status"), "").unwrap();
+    let _running = start_interactive(&f, "a", true);
+    wait_until(&f, || {
+        controls(&f).as_object().unwrap().values().any(|s| {
+            s["child"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| f.source.join(format!("sessions/{pid}.json")).exists())
+        })
+    });
+    let before = controls(&f)
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let root = before["root"].as_str().unwrap().to_string();
+    let path = f.data.join("cs/routing.json");
+    let mut registry = f.registry();
+    for lease in registry["leases"].as_object_mut().unwrap().values_mut() {
+        lease["hot"] = json!(true);
+    }
+    fs::write(&path, registry.to_string()).unwrap();
+    let output = f
+        .command()
+        .args(["switch", "b", "--session", &root])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("Switched {root}: a -> b")));
+    assert_eq!(f.registry()["bindings"][&root]["alias"], "b");
+    let sessions = f.command().arg("sessions").output().unwrap();
+    let listed = String::from_utf8_lossy(&sessions.stdout);
+    assert!(
+        listed.contains(&format!("{root}  b  pid")) && listed.contains("[instant switch]"),
+        "{listed}"
+    );
+    let after = controls(&f)
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(after["child"], before["child"]);
+    assert!(after["request"].is_null());
+    assert!(!f.temp.path().join("terminated.jsonl").exists());
+    fs::write(f.temp.path().join("finish-response"), "").unwrap();
 }
 
 #[test]

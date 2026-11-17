@@ -8,6 +8,9 @@ pub struct Lease {
     pub expires_at: Option<i64>,
     pub process: Process,
     pub root: Option<String>,
+    /// Requests reach Anthropic through the router, which picks the account per request.
+    #[serde(default)]
+    pub hot: bool,
 }
 impl Lease {
     pub fn alive(&self) -> bool {
@@ -83,6 +86,7 @@ mod tests {
                     expires_at: None,
                     process: Process::current().unwrap(),
                     root: Some("root".into()),
+                    hot: false,
                 },
             );
         }

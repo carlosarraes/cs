@@ -15,6 +15,75 @@ pub struct Endpoint {
 pub fn endpoint_path() -> Result<PathBuf> {
     Ok(state::state_path()?.with_file_name("proxy.json"))
 }
+/// Port of a live session router, if one answers.
+fn router_port() -> Option<u16> {
+    let bytes = std::fs::read(endpoint_path().ok()?).ok()?;
+    let endpoint: Endpoint = serde_json::from_slice(&bytes).ok()?;
+    (endpoint.process.alive() && serves_hot_route(endpoint.port)).then_some(endpoint.port)
+}
+
+/// Routers from before per-request switching lack `/hot`; sessions must not point at them.
+fn serves_hot_route(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let timeout = std::time::Duration::from_millis(500);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut reply = [0u8; 16];
+    stream
+        .write_all(b"GET /hot HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .and_then(|_| stream.read(&mut reply))
+        .is_ok_and(|n| {
+            reply[..n].starts_with(b"HTTP/1.1 200") || reply[..n].starts_with(b"HTTP/1.0 200")
+        })
+}
+
+/// Starts `cs start` in the background when no router is running, so sessions
+/// can switch accounts per request. `None` falls back to restart-based switching.
+fn ensure_router() -> Option<u16> {
+    if std::env::var_os("CS_NO_ROUTER").is_some() {
+        return None;
+    }
+    if let Some(port) = router_port() {
+        return Some(port);
+    }
+    let running = std::fs::read(endpoint_path().ok()?)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Endpoint>(&b).ok())
+        .is_some_and(|e| e.process.alive());
+    if running {
+        eprintln!("cs: the running session router predates instant switching; restart `cs start` to enable it");
+        return None;
+    }
+    use std::os::unix::process::CommandExt;
+    eprintln!("cs: starting the session router in the background");
+    std::process::Command::new(std::env::current_exe().ok()?)
+        .arg("start")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if let Some(port) = router_port() {
+            return Some(port);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    eprintln!(
+        "cs: session router did not start; account switches will restart Claude (see cs logs)"
+    );
+    None
+}
+
+fn hot_base_url(port: u16, token: &str) -> String {
+    format!("http://127.0.0.1:{port}/s/{token}")
+}
+
 pub fn write_endpoint(port: u16) -> Result<()> {
     util::atomic_write(
         &endpoint_path()?,
@@ -151,6 +220,15 @@ pub fn run(mut args: Vec<OsString>, requested: Option<&str>) -> Result<()> {
             crate::native::command(&profile, args.clone())?
         };
         command.env("CS_NATIVE_LEASE", &token);
+        let hot = if account.is_key() {
+            None
+        } else {
+            ensure_router()
+        };
+        if let Some(port) = hot {
+            command.env("ANTHROPIC_BASE_URL", hot_base_url(port, &token));
+            store.mark_hot(&token)?;
+        }
         use std::io::IsTerminal;
         let unsupported = if account.is_key() {
             Some("API key conversations cannot change accounts; start a new conversation".into())
@@ -421,6 +499,13 @@ fn prepare_move(
     rollback
         .env("CS_NATIVE_LEASE", token)
         .current_dir(&session.cwd);
+    let hot = Store::default_path()?.read(|s| Ok(s.leases.get(token).is_some_and(|l| l.hot)))?;
+    if let Some(port) = router_port().filter(|_| hot) {
+        rollback.env("ANTHROPIC_BASE_URL", hot_base_url(port, token));
+        if !account.is_key() {
+            next.env("ANTHROPIC_BASE_URL", hot_base_url(port, token));
+        }
+    }
     Ok(MovePreparation {
         target,
         root: session.root.clone(),
@@ -636,7 +721,8 @@ pub fn switch_targeted(
         uuid::Uuid::parse_str(root)
             .context("--session requires a conversation UUID from cs sessions")?;
     }
-    let (destination_alias, _) = resolve_account(&accounts, destination)?;
+    let (destination_alias, destination_account) = resolve_account(&accounts, destination)?;
+    let hot_capable = !destination_account.is_key();
     let mut selected = Store::default_path()?.update(|s| {
         Ok(s.leases
             .iter()
@@ -654,6 +740,7 @@ pub fn switch_targeted(
                         root.clone(),
                         binding.alias.clone(),
                         lease.process.clone(),
+                        lease.hot,
                     )
                 })
             })
@@ -661,7 +748,10 @@ pub fn switch_targeted(
     })?;
     if source.is_none() && session.is_none() {
         let controls = Controls::default_path()?.update(|sessions| Ok(sessions.clone()))?;
-        selected.retain(|(token, root, _, _)| {
+        selected.retain(|(token, root, _, _, hot)| {
+            if *hot && hot_capable {
+                return true;
+            }
             let reason = match controls.get(token) {
                 Some(control) => control.unsupported.as_deref(),
                 None => Some("launcher does not support targeted switching; reopen it with the updated cs run"),
@@ -688,6 +778,27 @@ pub fn switch_targeted(
         email: account.email,
     };
     let controls = Controls::default_path()?;
+    let (hot, selected): (Vec<_>, Vec<_>) = selected
+        .into_iter()
+        .partition(|(_, _, _, _, hot)| *hot && hot_capable);
+    if !hot.is_empty() {
+        let roots: Vec<String> = hot.iter().map(|(_, root, ..)| root.clone()).collect();
+        // The process keeps its launch profile; only the account its requests use changes.
+        Store::default_path()?.rebind(&roots, &target.alias, &target.email)?;
+        for (_, root, old, ..) in &hot {
+            println!(
+                "Switched {root}: {old} -> {} (next request uses it; no restart)",
+                target.alias
+            );
+        }
+    }
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let selected: Vec<_> = selected
+        .into_iter()
+        .map(|(token, root, old, process, _)| (token, root, old, process))
+        .collect();
     let idle = controls.update(|sessions| {
         Ok(selected
             .iter()
@@ -805,7 +916,8 @@ pub fn sessions() -> Result<()> {
                         .or_else(|| c.error.as_ref().map(|error| format!("  switch: {error}")))
                 })
                 .unwrap_or_default();
-            println!("{}  {}  pid {}{}", root, account, lease.process.pid, status);
+            let mode = if lease.hot { "  [instant switch]" } else { "" };
+            println!("{root}  {account}  pid {}{mode}{status}", lease.process.pid);
         }
         Ok(())
     })

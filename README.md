@@ -202,7 +202,21 @@ cs switch carlos2 --from carlos3 --interrupt
 `--from ALIAS` is an equivalent selector; both conflict with `--session UUID`.
 Selectors leave the shared login unchanged and cannot be combined with `--yes`.
 
-A targeted switch validates the destination and queues a restart of only the
+### Instant switching
+
+`cs run` points Claude at the local session router
+(`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/s/<session>`) and keeps its native
+claude.ai login. The router sends each request upstream as whichever account
+the conversation is bound to at that moment, so `cs switch` only updates that
+binding: the next request, even mid-turn, uses the new account and nothing
+restarts. `cs run` starts `cs start` in the background when no router is
+running; a router from an older cs must be restarted first. `cs sessions` marks
+these conversations `[instant switch]`. `CS_NO_ROUTER=1` opts a launch out.
+
+### Restart-based switching
+
+Sessions launched before instant switching, without a router, or moving to an
+API key restart instead. A targeted switch validates the destination and queues a restart of only the
 selected conversations, preserving their UUID, working directory, and supported
 launch flags. It leaves the shared login and other processes alone. By default
 it waits for Claude to report idle with no background agents.
