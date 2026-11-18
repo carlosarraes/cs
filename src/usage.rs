@@ -187,7 +187,8 @@ pub fn observe(
 }
 
 /// Whether an account needs a fresh poll: never while backed off after a 429;
-/// always for the current account otherwise; non-current ones only once their
+/// always for the current account or one without a usable reading (a failed
+/// fetch, e.g. before re-login, must not block routing); others only once their
 /// last fetch is older than `idle_poll_secs`.
 fn needs_poll(prev: Option<&Entry>, is_current: bool, now: i64, idle_poll_secs: u64) -> bool {
     let Some(prev) = prev else {
@@ -197,6 +198,7 @@ fn needs_poll(prev: Option<&Entry>, is_current: bool, now: i64, idle_poll_secs: 
         return false;
     }
     is_current
+        || prev.reading.known().is_none()
         || prev
             .fetched_at
             .is_none_or(|t| now - t >= idle_poll_secs as i64)
@@ -806,6 +808,13 @@ mod tests {
         limited.backoff_until = Some(1500);
         assert!(!needs_poll(Some(&limited), true, 1400, 300));
         assert!(needs_poll(Some(&limited), true, 1500, 300));
+        let failed = Entry::new(
+            Reading::Unknown {
+                reason: "401".into(),
+            },
+            1000,
+        );
+        assert!(needs_poll(Some(&failed), false, 1001, 300));
     }
 
     #[test]
