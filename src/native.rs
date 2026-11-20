@@ -202,6 +202,7 @@ pub fn maintain_account(alias: &str, email: &str) -> Result<()> {
     if account.email != email {
         bail!("{alias}: account identity changed; refusing to replace running credentials");
     }
+    let _profile = crate::renewal::profile_lock(alias)?;
     require_profile_identity(&profile, email)?;
     sync_credentials(&profile, &account.data["claudeAiOauth"])
 }
@@ -227,6 +228,7 @@ pub fn sync_all() -> Result<()> {
             continue;
         }
         let result = (|| -> Result<()> {
+            let _profile = crate::renewal::profile_lock(alias)?;
             let config = read_json(&profile.join(".claude.json"))?;
             if config["oauthAccount"]["emailAddress"].as_str() == Some(&account.email) {
                 sync_credentials(&profile, &account.data["claudeAiOauth"])?;
@@ -238,6 +240,18 @@ pub fn sync_all() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Hand a just-rotated access token to `alias`'s profile, if it has one for `email`. The caller
+/// holds `credential_lock` and that profile's `renewal::profile_lock`.
+pub fn sync_renewed(alias: &str, email: &str, saved: &Value) -> Result<()> {
+    let profile = profile_path(alias)?;
+    if read_json(&profile.join(".claude.json"))?["oauthAccount"]["emailAddress"].as_str()
+        != Some(email)
+    {
+        return Ok(());
+    }
+    sync_credentials(&profile, saved)
 }
 
 fn sync_credentials(profile: &Path, saved: &Value) -> Result<()> {
@@ -254,6 +268,7 @@ fn sync_credentials(profile: &Path, saved: &Value) -> Result<()> {
 pub fn prepare(alias: &str, account: &state::Account, source: &Path) -> Result<PathBuf> {
     let _credentials = crate::accounts::credential_lock()?;
     let profile = profile_path(alias)?;
+    let _profile = crate::renewal::profile_lock(alias)?;
     let source_global = if source == util::home()?.join(".claude") {
         util::home()?.join(".claude.json")
     } else {
@@ -280,6 +295,7 @@ pub fn prepare_exec(alias: &str, account: &state::Account, source: &Path) -> Res
     }
     let _credentials = crate::accounts::credential_lock()?;
     let profile = profile_path(alias)?;
+    let _profile = crate::renewal::profile_lock(alias)?;
     let source_global = if source == util::home()?.join(".claude") {
         util::home()?.join(".claude.json")
     } else {

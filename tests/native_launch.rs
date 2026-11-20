@@ -150,7 +150,7 @@ fn usage_attempts_nonshared_renewal_with_unmanaged_process_and_unreadable_login(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("b: no refresh token saved"),
+        stderr.contains("b: renewal (idle, no sessions, expired) failed: no refresh token saved"),
         "renewal was skipped: {stderr}"
     );
     assert!(!stderr.contains("expired-b"));

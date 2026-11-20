@@ -1,4 +1,4 @@
-use crate::{claude, commands, routing::store::Store, state, usage};
+use crate::{claude, commands, renewal, routing::store::Store, state, usage};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -112,12 +112,15 @@ pub fn unmanaged_claude_running() -> bool {
         .any(|pid| !managed.contains(pid))
 }
 
+/// Idle due time for the current account. With live sessions it renews only within
+/// `renewal::NEAR_EXPIRY_MS`; `renew_native_account_within` applies the same rule again.
 const CURRENT_RENEW_MARGIN_MS: i64 = 30 * 60 * 1000;
 
 fn renew_current_with(
     accounts: &state::ProviderState,
     now_ms: i64,
-    mut renew: impl FnMut(&str, &str, i64) -> Result<()>,
+    sessions: impl FnOnce(&str) -> renewal::Sessions,
+    renew: impl FnOnce(&str, &str, i64) -> Result<()>,
 ) -> Result<()> {
     let Some(alias) = accounts.current.as_deref() else {
         return Ok(());
@@ -125,17 +128,21 @@ fn renew_current_with(
     let Some(account) = accounts.accounts.get(alias) else {
         return Ok(());
     };
-    if !account.is_key()
-        && account.data["claudeAiOauth"]["expiresAt"]
-            .as_i64()
-            .is_some_and(|expiry| expiry <= now_ms.saturating_add(CURRENT_RENEW_MARGIN_MS))
-    {
+    if account.is_key() {
+        return Ok(());
+    }
+    let expires_at = account.data["claudeAiOauth"]["expiresAt"].as_i64();
+    if renewal::decide(now_ms, expires_at, CURRENT_RENEW_MARGIN_MS, sessions(alias)).is_some() {
         renew(alias, &account.email, CURRENT_RENEW_MARGIN_MS)?;
     }
     Ok(())
 }
 
 pub fn log_renewal_failure(alias: &str, error: &anyhow::Error) {
+    // A failed exchange attempt already logged itself with its reason.
+    if error.downcast_ref::<renewal::Failed>().is_some() {
+        return;
+    }
     // cs composes renewal errors; OAuth HTTP failures include only status and
     // the error code, never response bodies or credential contents.
     crate::daemon::log("credentials", &format!("{alias}: {error:#}"));
@@ -152,6 +159,7 @@ pub fn poll() -> Result<()> {
     if let Err(error) = renew_current_with(
         current.claude(),
         usage::now() * 1000,
+        renewal::live_sessions,
         commands::renew_native_account_within,
     ) {
         if let Some(alias) = current.claude().current.as_deref() {
@@ -177,13 +185,47 @@ pub fn poll() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn poll_renews_current_only_when_due() {
-        let now_ms = 10_000_000;
+    fn current_expiring_at(expiry: i64) -> crate::state::ProviderState {
         let mut accounts = crate::state::ProviderState {
             current: Some("current".into()),
             ..Default::default()
         };
+        accounts.accounts.insert(
+            "current".into(),
+            crate::state::Account {
+                kind: None,
+                email: "current@example.test".into(),
+                data: serde_json::json!({"claudeAiOauth": {"expiresAt": expiry}}),
+            },
+        );
+        accounts
+    }
+
+    fn renewals(expiry: i64, now_ms: i64, sessions: crate::renewal::Sessions) -> usize {
+        let mut calls = 0;
+        super::renew_current_with(
+            &current_expiring_at(expiry),
+            now_ms,
+            |alias| {
+                assert_eq!(alias, "current");
+                sessions
+            },
+            |alias, email, margin| {
+                assert_eq!(alias, "current");
+                assert_eq!(email, "current@example.test");
+                assert_eq!(margin, super::CURRENT_RENEW_MARGIN_MS);
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        calls
+    }
+
+    #[test]
+    fn poll_renews_idle_current_only_when_due() {
+        let now_ms = 10_000_000;
+        let idle = crate::renewal::Sessions::Known(0);
         for (expiry, expected_calls) in [
             (now_ms - 1, 1),
             (now_ms, 1),
@@ -192,24 +234,31 @@ mod tests {
             (now_ms + super::CURRENT_RENEW_MARGIN_MS + 1, 0),
             (now_ms + 8 * 60 * 60 * 1000, 0),
         ] {
-            accounts.accounts.insert(
-                "current".into(),
-                crate::state::Account {
-                    kind: None,
-                    email: "current@example.test".into(),
-                    data: serde_json::json!({"claudeAiOauth": {"expiresAt": expiry}}),
-                },
+            assert_eq!(
+                renewals(expiry, now_ms, idle),
+                expected_calls,
+                "expiry={expiry}"
             );
-            let mut calls = 0;
-            super::renew_current_with(&accounts, now_ms, |alias, email, margin| {
-                assert_eq!(alias, "current");
-                assert_eq!(email, "current@example.test");
-                assert_eq!(margin, super::CURRENT_RENEW_MARGIN_MS);
-                calls += 1;
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(calls, expected_calls, "expiry={expiry}");
+        }
+    }
+
+    #[test]
+    fn poll_leaves_current_with_live_sessions_alone_until_near_expiry() {
+        let now_ms = 10_000_000;
+        let live = crate::renewal::Sessions::Known(7);
+        let near = crate::renewal::NEAR_EXPIRY_MS;
+        for (expiry, expected_calls) in [
+            (now_ms + super::CURRENT_RENEW_MARGIN_MS, 0),
+            (now_ms + 20 * 60 * 1000, 0),
+            (now_ms + near + 1, 0),
+            (now_ms + near, 1),
+            (now_ms, 1),
+        ] {
+            assert_eq!(
+                renewals(expiry, now_ms, live),
+                expected_calls,
+                "expiry={expiry}"
+            );
         }
     }
 

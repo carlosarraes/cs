@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 
+use crate::renewal::{self, Reason};
 use crate::state::{self, Account, ProviderState, State};
 use crate::usage::{self, Observation};
 use crate::{claude, config, policy};
@@ -541,6 +542,7 @@ pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, 
         claude::capture().ok(),
         claude::configured_email().ok().flatten(),
     );
+    let counts = renewal::session_counts();
     let mut results = Vec::new();
     for (alias, account) in &initial.claude().accounts {
         if !refresh_is_owned(
@@ -549,41 +551,78 @@ pub fn refresh_idle_expired(skip: impl Fn(&str) -> bool) -> Result<Vec<(String, 
             account,
             live.as_ref(),
         ) || skip(alias)
-            || saved_expires_at(&account.data).is_none_or(|t| t > now_ms + REFRESH_MARGIN_MS)
         {
             continue;
         }
-        let result = (|| -> Result<()> {
-            let oauth = account
-                .data
-                .get("claudeAiOauth")
-                .ok_or_else(|| anyhow!("missing credentials"))?;
-            let refreshed = claude::refresh_oauth(oauth, now_ms)?;
+        let Some(reason) = renewal::decide(
+            now_ms,
+            saved_expires_at(&account.data),
+            REFRESH_MARGIN_MS,
+            renewal::sessions_in(counts.as_ref(), alias),
+        ) else {
+            continue;
+        };
+        let result = rotate_saved(alias, account, now_ms, reason).map(|_| ());
+        results.push((alias.clone(), result));
+    }
+    Ok(results)
+}
+
+/// Spend `account`'s saved grant and persist the rotated one, then hand the new access token to
+/// its native profile. The caller holds `credential_lock`; the profile lock keeps any other
+/// writer of this profile out from the exchange until the new grant is saved.
+fn rotate_saved(alias: &str, account: &Account, now_ms: i64, reason: Reason) -> Result<Value> {
+    let attempt = || -> Result<Value> {
+        let _profile = renewal::profile_lock(alias)?;
+        let original = account
+            .data
+            .get("claudeAiOauth")
+            .ok_or_else(|| anyhow!("missing credentials"))?;
+        let unchanged = |latest: &State| {
+            latest.claude().accounts.get(alias).is_some_and(|t| {
+                t.email == account.email && t.data.get("claudeAiOauth") == Some(original)
+            })
+        };
+        if !unchanged(&State::load()?) {
+            return Err(anyhow!(
+                "credentials changed before renewal; refusing to spend a stale grant"
+            ));
+        }
+        let refreshed = claude::refresh_oauth(original, now_ms)?;
+        {
             let _lock = state::lock()?;
             let mut latest = State::load()?;
-            let target = latest
-                .claude_mut()
-                .accounts
-                .get_mut(alias)
-                .ok_or_else(|| anyhow!("account removed during refresh"))?;
-            if target.email != account.email || target.data.get("claudeAiOauth") != Some(oauth) {
+            if !unchanged(&latest) {
                 return Err(anyhow!(
                     "credentials changed during refresh; refusing to overwrite them"
                 ));
             }
-            target.data["claudeAiOauth"] = refreshed;
-            latest.save()
-        })();
-        results.push((alias.clone(), result));
-    }
-    Ok(results)
+            latest
+                .claude_mut()
+                .accounts
+                .get_mut(alias)
+                .ok_or_else(|| anyhow!("account removed during refresh"))?
+                .data["claudeAiOauth"] = refreshed.clone();
+            latest.save()?;
+        }
+        renewal::log_renewed(alias, reason, refreshed["expiresAt"].as_i64());
+        if let Err(error) = crate::native::sync_renewed(alias, &account.email, &refreshed) {
+            crate::daemon::record(
+                "credentials",
+                &format!("{alias}: renewed token not yet in native profile: {error:#}"),
+            );
+        }
+        Ok(refreshed)
+    };
+    attempt().map_err(|error| renewal::failed(alias, reason, error))
 }
 
 pub fn renew_native_account(alias: &str, email: &str) -> Result<()> {
     renew_native_account_within(alias, email, REFRESH_MARGIN_MS)
 }
 
-/// Renew only when the saved access token expires within `margin_ms`.
+/// Renew when the saved access token expires within `margin_ms`, or within
+/// `renewal::NEAR_EXPIRY_MS` while live sessions use the account.
 pub fn renew_native_account_within(alias: &str, email: &str, margin_ms: i64) -> Result<()> {
     let _credentials = crate::accounts::credential_lock()?;
     let initial = State::load()?;
@@ -601,9 +640,14 @@ pub fn renew_native_account_within(alias: &str, email: &str, margin_ms: i64) -> 
         ));
     }
     let now_ms = usage::now() * 1000;
-    if saved_expires_at(&account.data).is_none_or(|time| time > now_ms + margin_ms) {
+    let Some(reason) = renewal::decide(
+        now_ms,
+        saved_expires_at(&account.data),
+        margin_ms,
+        renewal::live_sessions(alias),
+    ) else {
         return Ok(());
-    }
+    };
     let live = renewal_login(
         claude::capture().ok(),
         claude::configured_email().ok().flatten(),
@@ -633,20 +677,7 @@ pub fn renew_native_account_within(alias: &str, email: &str, margin_ms: i64) -> 
     if shared {
         claude::write_live_oauth(&live.1["claudeAiOauth"])?;
     }
-    let original = &account.data["claudeAiOauth"];
-    let refreshed = claude::refresh_oauth(original, now_ms)?;
-    let _lock = state::lock()?;
-    let mut latest = State::load()?;
-    let target = latest
-        .claude_mut()
-        .accounts
-        .get_mut(alias)
-        .context("native account was removed during renewal")?;
-    if target.email != account.email || target.data["claudeAiOauth"] != *original {
-        return Err(anyhow!("native account credentials changed during renewal"));
-    }
-    target.data["claudeAiOauth"] = refreshed.clone();
-    latest.save()?;
+    let refreshed = rotate_saved(alias, account, now_ms, reason)?;
     if shared {
         claude::write_live_oauth(&refreshed)?;
     }
@@ -904,5 +935,164 @@ mod tests {
             Some("personal")
         );
         assert_eq!(matched_alias(&ps, "nobody@x.com"), None);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod renewal_tests {
+    use super::*;
+    use crate::{routing::store::Store, testenv::TestEnv};
+    use serde_json::json;
+
+    const MIN: i64 = 60_000;
+
+    fn save_account(alias: &str, refresh: &str, left_ms: i64) {
+        let email = format!("{alias}@example.test");
+        let mut state = State::load().unwrap();
+        state.claude_mut().accounts.insert(
+            alias.into(),
+            Account {
+                kind: None,
+                email: email.clone(),
+                data: json!({
+                    "claudeAiOauth": {
+                        "accessToken": "access-old",
+                        "refreshToken": refresh,
+                        "expiresAt": usage::now() * 1000 + left_ms,
+                        "scopes": ["user:inference"],
+                    },
+                    "oauthAccount": {"emailAddress": email},
+                }),
+            },
+        );
+        state.save().unwrap();
+    }
+
+    fn email(alias: &str) -> String {
+        format!("{alias}@example.test")
+    }
+
+    fn saved(alias: &str) -> Value {
+        State::load().unwrap().claude().accounts[alias].data["claudeAiOauth"].clone()
+    }
+
+    fn live_session(alias: &str) {
+        Store::default_path()
+            .unwrap()
+            .register_pinned(alias, &email(alias))
+            .unwrap();
+    }
+
+    fn assert_no_secrets(log: &str) {
+        for secret in ["access-", "refresh-", "sk-", "refreshToken", "accessToken"] {
+            assert!(!log.contains(secret), "{secret} leaked into: {log}");
+        }
+    }
+
+    #[test]
+    fn live_session_blocks_early_renewal_of_current_alias() {
+        let env = TestEnv::new();
+        save_account("work", "refresh-old", 20 * MIN);
+        let mut state = State::load().unwrap();
+        state.claude_mut().current = Some("work".into());
+        state.save().unwrap();
+        live_session("work");
+        renew_native_account_within("work", &email("work"), 30 * MIN).unwrap();
+        renew_native_account("work", &email("work")).unwrap();
+        assert_eq!(env.exchanges(), 0);
+        assert_eq!(saved("work")["refreshToken"], "refresh-old");
+        assert_eq!(env.log(), "");
+    }
+
+    #[test]
+    fn near_expiry_renews_despite_live_sessions_and_logs_without_secrets() {
+        let env = TestEnv::new();
+        env.unrelated_live_login();
+        env.profile_for("work", &email("work"));
+        save_account("work", "refresh-old", 10 * MIN);
+        live_session("work");
+        live_session("work");
+        renew_native_account("work", &email("work")).unwrap();
+        assert_eq!(env.exchanges(), 1);
+        assert_eq!(saved("work")["refreshToken"], "refresh-new");
+        let profile = claude::read_profile_oauth(&env.profile("work"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile["accessToken"], "access-new");
+        assert!(profile.get("refreshToken").is_none());
+        let log = env.log();
+        assert!(
+            log.contains("work: renewed (near expiry, ")
+                && log.contains("m left, 2 live sessions); new token expires 20"),
+            "{log}"
+        );
+        assert_no_secrets(&log);
+    }
+
+    #[test]
+    fn idle_alias_renews_when_due_and_fresh_ones_wait() {
+        let env = TestEnv::new();
+        env.unrelated_live_login();
+        save_account("due", "refresh-old", 4 * MIN);
+        save_account("fresh", "refresh-old", 20 * MIN);
+        let results = refresh_idle_expired(|_| false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "due");
+        assert!(results[0].1.is_ok());
+        assert_eq!(env.exchanges(), 1);
+        assert_eq!(saved("due")["refreshToken"], "refresh-new");
+        assert_eq!(saved("fresh")["refreshToken"], "refresh-old");
+        let log = env.log();
+        assert!(log.contains("due: renewed (idle, no sessions, "), "{log}");
+        assert_no_secrets(&log);
+    }
+
+    #[test]
+    fn concurrent_refreshers_of_one_profile_exchange_once() {
+        let env = TestEnv::new();
+        env.unrelated_live_login();
+        env.profile_for("work", &email("work"));
+        save_account("work", "refresh-old", 4 * MIN);
+        env.slow_exchange(300);
+        let poll = std::thread::spawn(|| refresh_idle_expired(|_| false).unwrap());
+        let maintain = std::thread::spawn(|| renew_native_account("work", &email("work")));
+        let polled = poll.join().unwrap();
+        maintain.join().unwrap().unwrap();
+        assert!(polled.iter().all(|(_, result)| result.is_ok()));
+        assert_eq!(env.exchanges(), 1);
+        assert_eq!(saved("work")["refreshToken"], "refresh-new");
+        assert_eq!(env.log().matches("work: renewed").count(), 1);
+    }
+
+    #[test]
+    fn profile_lock_holds_off_the_exchange() {
+        let env = TestEnv::new();
+        env.unrelated_live_login();
+        save_account("work", "refresh-old", 4 * MIN);
+        let held = renewal::profile_lock("work").unwrap();
+        let renew = std::thread::spawn(|| renew_native_account("work", &email("work")));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(env.exchanges(), 0);
+        drop(held);
+        renew.join().unwrap().unwrap();
+        assert_eq!(env.exchanges(), 1);
+    }
+
+    #[test]
+    fn failed_renewal_is_logged_once_with_its_reason() {
+        let env = TestEnv::new();
+        env.unrelated_live_login();
+        save_account("work", "refresh-spent", 4 * MIN);
+        let error = renew_native_account("work", &email("work")).unwrap_err();
+        crate::accounts::log_renewal_failure("work", &error);
+        let log = env.log();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(
+            log.contains("work: renewal (idle, no sessions, ")
+                && log.contains("failed: token refresh failed: HTTP 400 invalid_grant"),
+            "{log}"
+        );
+        assert_eq!(saved("work")["refreshToken"], "refresh-spent");
+        assert_no_secrets(&log);
     }
 }
