@@ -11,11 +11,14 @@ mod login;
 mod native;
 mod policy;
 mod proxy;
+mod renewal;
 mod routing;
 mod session_control;
 mod snapshot;
 mod state;
 mod t3_guide;
+#[cfg(test)]
+mod testenv;
 mod usage;
 mod util;
 

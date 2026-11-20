@@ -19,6 +19,7 @@ pub fn log_path() -> Result<PathBuf> {
 /// rotating to `daemon.log.1` past 1 MB. Lines are stamped `[HH:MM]` local time.
 pub struct Logger {
     file: Option<File>,
+    echo: bool,
 }
 
 impl Logger {
@@ -43,7 +44,10 @@ impl Logger {
             .mode(0o600)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        Ok(Logger { file: Some(file) })
+        Ok(Logger {
+            file: Some(file),
+            echo: true,
+        })
     }
 
     fn stamp() -> String {
@@ -65,8 +69,10 @@ impl Logger {
             out.push_str(line);
             out.push('\n');
         }
-        print!("{out}");
-        io::stdout().flush().ok();
+        if self.echo {
+            print!("{out}");
+            io::stdout().flush().ok();
+        }
         if let Some(f) = &mut self.file {
             f.write_all(out.as_bytes()).ok();
         }
@@ -78,6 +84,14 @@ pub fn log(kind: &str, msg: &str) {
         logger.log(kind, msg);
     }
 }
+/// Append to `daemon.log` only, for events from commands whose stdout belongs to the user.
+pub fn record(kind: &str, msg: &str) {
+    if let Ok(mut logger) = Logger::open() {
+        logger.echo = false;
+        logger.log(kind, msg);
+    }
+}
+
 pub fn log_block(kind: &str, lines: &[String]) {
     if let Ok(mut logger) = Logger::open() {
         logger.block(kind, lines);

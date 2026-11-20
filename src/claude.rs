@@ -121,6 +121,14 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// expiry; other keys (`subscriptionType`, …) are kept. The server rotates the
 /// refresh token, so the result MUST be persisted or the account is logged out.
 pub fn refresh_oauth(oauth: &Value, now_ms: i64) -> Result<Value> {
+    #[cfg(test)]
+    return crate::testenv::exchange(oauth, now_ms);
+    #[cfg(not(test))]
+    exchange(oauth, now_ms)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn exchange(oauth: &Value, now_ms: i64) -> Result<Value> {
     let refresh_token = oauth
         .get("refreshToken")
         .and_then(Value::as_str)
