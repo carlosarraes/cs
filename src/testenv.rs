@@ -1,5 +1,7 @@
 //! Isolated data and Claude config dirs for tests that exercise credential renewal, plus a stub
 //! for the OAuth exchange so no test can reach the real token endpoint.
+// TestEnv is only used by renewal_tests, which are not built on macOS.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
